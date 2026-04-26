@@ -22,3 +22,5 @@ from .i3dictvalueextractor import I3DictValueExtractor
 from .i3filtermapextractor import I3FilterMapExtractor
 from .i3highesteparticleextractor import I3HighestEparticleExtractor
 from .i3calorimetry import I3Calorimetry
+from .i3featureextractor import I3FeatureExtractorPONE
+from .i3truthextractor import I3TruthExtractorPONE
