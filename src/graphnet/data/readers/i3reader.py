@@ -102,7 +102,7 @@ class I3Reader(GraphNeTFileReader):
             # Try to extract data from I3Frame
             results = [extractor(frame) for extractor in self._extractors]
 
-            data_dict = OrderedDict(zip(self.extracor_names, results))
+            data_dict = OrderedDict(zip(self.extractor_names, results))
 
             data.append(data_dict)
         return data
@@ -203,9 +203,7 @@ class PONE_Reader(GraphNeTFileReader):
 
         super().__init__(name=__name__, class_name=self.__class__.__name__)
 
-    @property
-    def extractor_names(self) -> list[str]:
-        return self.extracor_names
+
 
     def __call__(
         self, file_path: I3FileSet

@@ -22,6 +22,8 @@ if has_icecube_package() or TYPE_CHECKING:
     )  # pyright: reportMissingImports=false
 
 
+#### check if the truth extractor correct as you want
+
 class I3TruthExtractor(I3Extractor):
     """Class for extracting truth-level information."""
 
@@ -542,14 +544,17 @@ class I3TruthExtractor(I3Extractor):
 
 
 
-class I3TruthExtractorPONE(I3Extractor):
-    """Truth-level extractor for PONE simulations.
 
-    Compared to I3TruthExtractor, this class:
-      - Derives detector boundaries dynamically from the GCD file instead
-        of relying on hardcoded IceCube coordinates.
-      - Does not filter on sub_event_stream (no InIceSplit/Final requirement),
-        since PONE data does not use that frame splitting convention.
+
+class I3TruthExtractorPONE(I3Extractor):
+    """Truth + injection parameter extractor for PONE simulations.
+
+    Extracts per-event kinematics from EventProperties, injection configuration
+    from LeptonInjectorProperties, and the primary particle vertex from the
+    MCTree.  Also computes two containment flags:
+
+    - ``vertex_inside_detector_volume``: neutrino interaction vertex is inside the detector.
+    - ``is_ending``:   muon track endpoint is inside the detector (muon only).
     """
 
     def __init__(
@@ -562,466 +567,203 @@ class I3TruthExtractorPONE(I3Extractor):
         """Construct I3TruthExtractorPONE.
 
         Args:
-            name: Name of the I3Extractor instance.
-            mctree: Name of the MC tree to use for truth values.
-            extend_boundary: Distance in metres to extend the convex hull of
-                the detector when defining starting events. Defaults to 0.
+            name: Name of the `I3Extractor` instance.
+            mctree: Name of the MC tree used to read the primary particle.
+            extend_boundary: Distance in metres to expand the convex hull of
+                the detector when testing vertex containment. Defaults to 0.
             exclude: List of keys to exclude from the extracted data.
         """
         super().__init__(name, exclude=exclude)
-
-        # Borders cannot be computed here because the GCD file has not been
-        # loaded yet. They will be set in set_gcd() once sensor positions
-        # are available.
-        self._borders = None
-        self._extend_boundary = extend_boundary
         self._mctree = mctree
+        self._extend_boundary = extend_boundary
 
     def set_gcd(self, i3_file: str, gcd_file: Optional[str] = None) -> None:
-        """Load GCD file and derive detector geometry.
-
-        Calls the parent implementation to populate self._gcd_dict, then
-        computes detector boundaries and the Delaunay triangulation used for
-        vertex containment checks — all from actual sensor positions rather
-        than hardcoded coordinates.
+        """Load GCD file and build the Delaunay hull for containment checks.
 
         Args:
             i3_file: Path to the i3 file being converted.
-            gcd_file: Path to the GCD file. If None, the method will look for
-                G and C frames inside i3_file.
+            gcd_file: Path to the GCD file. If None, looks in i3_file.
         """
         super().set_gcd(i3_file=i3_file, gcd_file=gcd_file)
 
-        # Collect 3D sensor positions from the GCD
         coordinates = np.array([
             [g.position.x, g.position.y, g.position.z]
             for g in self._gcd_dict.values()
         ])
 
-        # Optionally expand the boundary outward from the centroid.
-        # This is useful when you want to include events that interact just
-        # outside the instrumented volume.
         if self._extend_boundary != 0.0:
             center = np.mean(coordinates, axis=0)
             d = coordinates - center
             norms = np.linalg.norm(d, axis=1, keepdims=True)
-            dn = d / norms
-            coordinates = coordinates + dn * self._extend_boundary
+            coordinates = coordinates + (d / norms) * self._extend_boundary
 
-        # Build the 3D convex hull and Delaunay triangulation used by
-        # _contained_vertex() to test whether an interaction vertex lies
-        # inside the detector.
         hull = ConvexHull(coordinates)
         self.hull = hull
         self.delaunay = Delaunay(coordinates[hull.vertices])
 
-        # Derive the 2D (XY) boundary polygon and Z range used by
-        # _muon_stopped() to test whether a muon's final position lies
-        # within the fiducial volume.
-        xy = coordinates[:, :2]
-        hull_2d = ConvexHull(xy)
-        border_xy = xy[hull_2d.vertices]
-        border_z = np.array([coordinates[:, 2].min(), coordinates[:, 2].max()])
-        self._borders = [border_xy, border_z]
-
     def __call__(
         self, frame: "icetray.I3Frame", padding_value: Any = -1
     ) -> Dict[str, Any]:
-        """Extract truth-level information from a physics frame."""
-        is_mc = frame_is_montecarlo(frame, self._mctree)
-        is_noise = frame_is_noise(frame, self._mctree)
-        sim_type = self._find_data_type(is_mc, self._i3_file, frame)
-
+        """Extract LeptonInjector truth and injection parameters."""
         output = {
-            "energy": padding_value,
+            # I3EventHeader
+            "RunID": padding_value,
+            "SubrunID": padding_value,
+            "EventID": padding_value,
+            "SubEventID": padding_value,
+            # Primary particle (from MCTree)
             "position_x": padding_value,
             "position_y": padding_value,
             "position_z": padding_value,
-            "azimuth": padding_value,
-            "zenith": padding_value,
             "pid": padding_value,
-            "event_time": frame["I3EventHeader"].start_time.utc_daq_time,
-            "sim_type": sim_type,
             "interaction_type": padding_value,
             "elasticity": padding_value,
-            "RunID": frame["I3EventHeader"].run_id,
-            "SubrunID": frame["I3EventHeader"].sub_run_id,
-            "EventID": frame["I3EventHeader"].event_id,
-            "SubEventID": frame["I3EventHeader"].sub_event_id,
-            "dbang_decay_length": padding_value,
-            "track_length": padding_value,
-            "stopped_muon": padding_value,
-            "energy_track": padding_value,
-            "energy_cascade": padding_value,
-            "inelasticity": padding_value,
-            "DeepCoreFilter_13": padding_value,
-            "CascadeFilter_13": padding_value,
-            "MuonFilter_13": padding_value,
-            "OnlineL2Filter_17": padding_value,
-            "L3_oscNext_bool": padding_value,
-            "L4_oscNext_bool": padding_value,
-            "L5_oscNext_bool": padding_value,
-            "L6_oscNext_bool": padding_value,
-            "L7_oscNext_bool": padding_value,
-            "is_starting": padding_value,
+            # Containment flags
+            # vertex_inside_detector_volume: True if the neutrino interaction vertex lies inside
+            #              the instrumented detector volume
+            "vertex_inside_detector_volume": padding_value,
+            # is_ending: True if the muon track endpoint lies inside the
+            #            detector volume (muon events only)
+            "is_ending": padding_value,
+            # EventProperties — per-event kinematics
+            "totalEnergy": padding_value,
+            "zenith": padding_value,
+            "azimuth": padding_value,
+            "finalStateX": padding_value,
+            "finalStateY": padding_value,
+            "finalType1": padding_value,
+            "finalType2": padding_value,
+            "initialType": padding_value,
+            "totalColumnDepth": padding_value,  # ranged injection only
+            "impactParameter": padding_value,    # ranged injection only
+            # LeptonInjectorProperties — injection configuration
+            "EnergyMin": padding_value,
+            "EnergyMax": padding_value,
+            "ZenithMin": padding_value,
+            "ZenithMax": padding_value,
+            "AzimuthMin": padding_value,
+            "AzimuthMax": padding_value,
+            "PowerlawIndex": padding_value,
+            "InjectionRadius": padding_value,   # ranged only
+            "EndcapLength": padding_value,       # ranged only
+            "CylinderRadius": padding_value,     # volume only
+            "CylinderHeight": padding_value,     # volume only
         }
 
-        # Note: the InIceSplit / Final sub_event_stream filter present in
-        # I3TruthExtractor is intentionally omitted here. PONE data does not
-        # use that frame splitting convention.
+        if len(frame) == 0:
+            print("[I3TruthExtractorPONE] Empty frame, skipping.")
+            return output
 
-        if "FilterMask" in frame:
-            if "DeepCoreFilter_13" in frame["FilterMask"]:
-                output["DeepCoreFilter_13"] = int(
-                    bool(frame["FilterMask"]["DeepCoreFilter_13"])
-                )
-            if "CascadeFilter_13" in frame["FilterMask"]:
-                output["CascadeFilter_13"] = int(
-                    bool(frame["FilterMask"]["CascadeFilter_13"])
-                )
-            if "MuonFilter_13" in frame["FilterMask"]:
-                output["MuonFilter_13"] = int(
-                    bool(frame["FilterMask"]["MuonFilter_13"])
-                )
-            if "OnlineL2Filter_17" in frame["FilterMask"]:
-                output["OnlineL2Filter_17"] = int(
-                    bool(frame["FilterMask"]["OnlineL2Filter_17"])
-                )
-
-        elif "DeepCoreFilter_13" in frame:
-            output["DeepCoreFilter_13"] = int(bool(frame["DeepCoreFilter_13"]))
-
-        if "L3_oscNext_bool" in frame:
-            output["L3_oscNext_bool"] = int(bool(frame["L3_oscNext_bool"]))
-
-        if "L4_oscNext_bool" in frame:
-            output["L4_oscNext_bool"] = int(bool(frame["L4_oscNext_bool"]))
-
-        if "L5_oscNext_bool" in frame:
-            output["L5_oscNext_bool"] = int(bool(frame["L5_oscNext_bool"]))
-
-        if "L6_oscNext_bool" in frame:
-            output["L6_oscNext_bool"] = int(bool(frame["L6_oscNext_bool"]))
-
-        if "L7_oscNext_bool" in frame:
-            output["L7_oscNext_bool"] = int(bool(frame["L7_oscNext_bool"]))
-
-        if is_mc and (not is_noise):
-            (
-                MCInIcePrimary,
-                interaction_type,
-                elasticity,
-            ) = self._get_primary_particle_interaction_type_and_elasticity(
-                frame, sim_type
+        required = ["I3EventHeader", "EventProperties", "LeptonInjectorProperties"]
+        missing = [k for k in required if k not in frame]
+        if missing:
+            print(
+                f"[I3LeptonInjectorExtractorPONE] Missing frame keys {missing}, skipping."
             )
+            return output
 
-            try:
-                (
-                    energy_track,
-                    energy_cascade,
-                    inelasticity,
-                ) = self._get_primary_track_energy_and_inelasticity(frame)
-            except RuntimeError:
-                # Track energy calculation fails for some northern tracks where
-                # the Hadrons particle has no mass implemented.
-                energy_track, energy_cascade, inelasticity = (
-                    padding_value,
-                    padding_value,
-                    padding_value,
-                )
+        # I3EventHeader
+        header = frame["I3EventHeader"]
+        output.update(
+            {
+                "RunID": header.run_id,
+                "SubrunID": header.sub_run_id,
+                "EventID": header.event_id,
+                "SubEventID": header.sub_event_id,
+            }
+        )
 
+        # EventProperties
+        ep = frame["EventProperties"]
+        output.update(
+            {
+                "totalEnergy": ep.totalEnergy,
+                "zenith": ep.zenith,
+                "azimuth": ep.azimuth,
+                "finalStateX": ep.finalStateX,
+                "finalStateY": ep.finalStateY,
+                "finalType1": ep.finalType1,
+                "finalType2": ep.finalType2,
+                "initialType": ep.initialType,
+                "interaction_type": self._get_interaction_type(ep),
+                "elasticity": 1 - ep.finalStateY,
+            }
+        )
+        try:
+            output["totalColumnDepth"] = ep.totalColumnDepth
+            output["impactParameter"] = ep.impactParameter
+        except AttributeError:
+            pass  # volume injection — these fields don't exist
+
+        # LeptonInjectorProperties
+        props = frame["LeptonInjectorProperties"]
+        is_ranged = hasattr(props, "injectionRadius")
+        output.update(
+            {
+                "EnergyMin": props.energyMinimum,
+                "EnergyMax": props.energyMaximum,
+                "ZenithMin": props.zenithMinimum,
+                "ZenithMax": props.zenithMaximum,
+                "AzimuthMin": props.azimuthMinimum,
+                "AzimuthMax": props.azimuthMaximum,
+                "PowerlawIndex": props.powerlawIndex,
+                "InjectionRadius": props.injectionRadius if is_ranged else padding_value,
+                "EndcapLength": props.endcapLength if is_ranged else padding_value,
+                "CylinderRadius": props.cylinderRadius if not is_ranged else padding_value,
+                "CylinderHeight": props.cylinderHeight if not is_ranged else padding_value,
+            }
+        )
+
+        # Primary particle position and PID from MCTree
+        if self._mctree in frame:
+            primary = frame[self._mctree].primaries[0]
             output.update(
                 {
-                    "energy": MCInIcePrimary.energy,
-                    "position_x": MCInIcePrimary.pos.x,
-                    "position_y": MCInIcePrimary.pos.y,
-                    "position_z": MCInIcePrimary.pos.z,
-                    "azimuth": MCInIcePrimary.dir.azimuth,
-                    "zenith": MCInIcePrimary.dir.zenith,
-                    "pid": MCInIcePrimary.pdg_encoding,
-                    "interaction_type": interaction_type,
-                    "elasticity": elasticity,
-                    "dbang_decay_length": self._extract_dbang_decay_length(
-                        frame, padding_value
-                    ),
-                    "energy_track": energy_track,
-                    "energy_cascade": energy_cascade,
-                    "inelasticity": inelasticity,
+                    "position_x": primary.pos.x,
+                    "position_y": primary.pos.y,
+                    "position_z": primary.pos.z,
+                    "pid": primary.pdg_encoding,
                 }
             )
 
-            if abs(output["pid"]) == 13:
-                output.update({"track_length": MCInIcePrimary.length})
-                muon_final = self._muon_stopped(output, self._borders)
-                output.update(
-                    {
-                        # For muons, position_xyz is updated to the final
-                        # stopping position rather than the interaction vertex.
-                        "position_x": muon_final["x"],
-                        "position_y": muon_final["y"],
-                        "position_z": muon_final["z"],
-                        "stopped_muon": muon_final["stopped"],
-                    }
-                )
+            output["vertex_inside_detector_volume"] = self._contained_vertex(output)
 
-            output.update({"is_starting": self._contained_vertex(output)})
+            if abs(output["pid"]) == 13:
+                end_pos = self._muon_end_position(primary)
+                output["is_ending"] = self.delaunay.find_simplex(end_pos) >= 0
 
         return output
 
-    def _extract_dbang_decay_length(
-        self, frame: "icetray.I3Frame", padding_value: float = -1
-    ) -> float:
-        """Extract the decay length for double-bang (HNL) events.
-
-        Args:
-            frame: Physics frame containing MC record.
-            padding_value: Value returned when the decay length cannot be
-                determined.
-
-        Returns:
-            Decay length in metres, or padding_value on failure.
-        """
-        mctree = frame[self._mctree]
-        try:
-            p_true = mctree.primaries[0]
-            p_daughters = mctree.get_daughters(p_true)
-            if len(p_daughters) == 2:
-                for p_daughter in p_daughters:
-                    if p_daughter.type == dataclasses.I3Particle.Hadrons:
-                        casc_0_true = p_daughter
-                    else:
-                        hnl_true = p_daughter
-                hnl_daughters = mctree.get_daughters(hnl_true)
-            else:
-                decay_length = padding_value
-                hnl_daughters = []
-
-            if len(hnl_daughters) > 0:
-                for count_hnl_daughters, hnl_daughter in enumerate(
-                    hnl_daughters
-                ):
-                    if not count_hnl_daughters:
-                        casc_1_true = hnl_daughter
-                    else:
-                        assert casc_1_true.pos == hnl_daughter.pos
-                        casc_1_true.energy = (
-                            casc_1_true.energy + hnl_daughter.energy
-                        )
-                decay_length = (
-                    phys_services.I3Calculator.distance(
-                        casc_0_true, casc_1_true
-                    )
-                    / icetray.I3Units.m
-                )
-            else:
-                decay_length = padding_value
-
-            return decay_length
-        except:  # noqa: E722
-            return padding_value
-
-    def _muon_stopped(
-        self,
-        truth: Dict[str, Any],
-        borders: List[np.ndarray],
-        shrink_horizontally: float = 100.0,
-        shrink_vertically: float = 100.0,
-    ) -> Dict[str, Any]:
-        """Compute the muon's final position and whether it stopped inside
-        the fiducial volume.
-
-        The final position is calculated by propagating the muon from its
-        starting position along its direction vector by track_length metres.
-
-        IMPORTANT: The result is stored as position_x/y/z in the output dict,
-        overwriting the interaction vertex — consistent with how I3TruthExtractor
-        handles muons.
-
-        Args:
-            truth: Dictionary of already extracted truth-level information.
-            borders: [border_xy, border_z] where border_xy is an (N, 2) array
-                of polygon vertices in the XY plane and border_z is [z_min, z_max].
-            shrink_horizontally: Inward shrink of the XY polygon in metres.
-                Defaults to 100.
-            shrink_vertically: Inward shrink in the Z direction in metres.
-                Defaults to 100.
-
-        Returns:
-            Dictionary with keys x, y, z (final position) and stopped (bool).
-        """
-        border = mpath.Path(borders[0])
-
-        start_pos = np.array(
-            [truth["position_x"], truth["position_y"], truth["position_z"]]
-        )
-
-        # Propagate along the direction vector. The -1 factor is needed because
-        # zenith/azimuth in IceCube convention point toward the particle origin,
-        # not its direction of travel.
-        travel_vec = -1 * np.array(
-            [
-                truth["track_length"]
-                * np.cos(truth["azimuth"])
-                * np.sin(truth["zenith"]),
-                truth["track_length"]
-                * np.sin(truth["azimuth"])
-                * np.sin(truth["zenith"]),
-                truth["track_length"] * np.cos(truth["zenith"]),
-            ]
-        )
-
-        end_pos = start_pos + travel_vec
-
-        stopped_xy = border.contains_point(
-            (end_pos[0], end_pos[1]), radius=-shrink_horizontally
-        )
-        stopped_z = (end_pos[2] > borders[1][0] + shrink_vertically) * (
-            end_pos[2] < borders[1][1] - shrink_vertically
-        )
-
-        return {
-            "x": end_pos[0],
-            "y": end_pos[1],
-            "z": end_pos[2],
-            "stopped": (stopped_xy * stopped_z),
-        }
-
-    def _get_primary_particle_interaction_type_and_elasticity(
-        self,
-        frame: "icetray.I3Frame",
-        sim_type: str,
-        padding_value: float = -1.0,
-    ) -> Tuple[Any, int, float]:
-        """Return the primary MC particle, interaction type, and elasticity.
-
-        Args:
-            frame: Physics frame containing MC record.
-            sim_type: Simulation type string (e.g. 'LeptonInjector', 'NuGen').
-            padding_value: Fallback value used when a quantity cannot be read.
-
-        Returns:
-            Tuple of (MCInIcePrimary, interaction_type, elasticity) where
-            interaction_type is 1 (CC), 2 (NC), or padding_value.
-        """
-        if sim_type != "noise":
-            try:
-                MCInIcePrimary = frame["MCInIcePrimary"]
-            except KeyError:
-                MCInIcePrimary = frame[self._mctree][0]
-            if MCInIcePrimary.energy != MCInIcePrimary.energy:
-                # NaN check — occurs for some muons where the first MCTree
-                # entry has corrupted energy. The second entry is always valid.
-                MCInIcePrimary = frame[self._mctree][1]
-        else:
-            MCInIcePrimary = None
-
-        if sim_type == "LeptonInjector":
-            event_properties = frame["EventProperties"]
-            final_state_1 = event_properties.finalType1
-            if final_state_1 in [
-                dataclasses.I3Particle.NuE,
-                dataclasses.I3Particle.NuMu,
-                dataclasses.I3Particle.NuTau,
-                dataclasses.I3Particle.NuEBar,
-                dataclasses.I3Particle.NuMuBar,
-                dataclasses.I3Particle.NuTauBar,
-            ]:
-                interaction_type = 2  # NC
-            else:
-                interaction_type = 1  # CC
-
-            elasticity = 1 - event_properties.finalStateY
-
-        else:
-            try:
-                interaction_type = frame["I3MCWeightDict"]["InteractionType"]
-            except KeyError:
-                interaction_type = int(padding_value)
-
-            try:
-                elasticity = 1 - frame["I3MCWeightDict"]["BjorkenY"]
-            except KeyError:
-                elasticity = padding_value
-
-        return MCInIcePrimary, interaction_type, elasticity
-
-    def _get_primary_track_energy_and_inelasticity(
-        self,
-        frame: "icetray.I3Frame",
-    ) -> Tuple[float, float, float]:
-        """Compute track energy, cascade energy, and inelasticity from primary.
-
-        Args:
-            frame: Physics frame containing MC record.
-
-        Returns:
-            Tuple of (energy_track, energy_cascade, inelasticity).
-        """
-        mc_tree = frame[self._mctree]
-        primary = mc_tree.primaries[0]
-        daughters = mc_tree.get_daughters(primary)
-
-        tracks = [
-            d for d in daughters
-            if str(d.shape) in ("StartingTrack", "Dark")
+    def _get_interaction_type(self, ep: Any) -> int:
+        """Return 1 (CC) or 2 (NC) based on EventProperties finalType1."""
+        neutrinos = [
+            dataclasses.I3Particle.NuE,
+            dataclasses.I3Particle.NuMu,
+            dataclasses.I3Particle.NuTau,
+            dataclasses.I3Particle.NuEBar,
+            dataclasses.I3Particle.NuMuBar,
+            dataclasses.I3Particle.NuTauBar,
         ]
+        return 2 if ep.finalType1 in neutrinos else 1
 
-        energy_total = primary.total_energy
-        energy_track = sum(t.total_energy for t in tracks)
-        energy_cascade = energy_total - energy_track
-        inelasticity = 1.0 - energy_track / energy_total
-
-        return energy_track, energy_cascade, inelasticity
-
-    def _find_data_type(
-        self, mc: bool, input_file: str, frame: "icetray.I3Frame"
-    ) -> str:
-        """Determine the simulation or data type from the file path and frame.
-
-        Args:
-            mc: Whether the input file is Monte Carlo simulation.
-            input_file: Path to the i3 file.
-            frame: Physics frame, used as fallback when path is uninformative.
-
-        Returns:
-            A string identifying the data type, e.g. 'LeptonInjector', 'NuGen',
-            'muongun', 'corsika', 'genie', 'noise', or 'data'.
-        """
-        if not mc:
-            sim_type = "data"
-        elif "muon" in input_file:
-            sim_type = "muongun"
-        elif "corsika" in input_file:
-            sim_type = "corsika"
-        elif "genie" in input_file or "nu" in input_file.lower():
-            sim_type = "genie"
-        elif "noise" in input_file:
-            sim_type = "noise"
-        elif frame.Has("EventProperties") or frame.Has(
-            "LeptonInjectorProperties"
-        ):
-            sim_type = "LeptonInjector"
-        elif frame.Has("I3MCWeightDict"):
-            sim_type = "NuGen"
-        else:
-            raise NotImplementedError("Could not determine data type.")
-        return sim_type
+    def _muon_end_position(self, primary: Any) -> np.ndarray:
+        """Compute the 3D endpoint of a muon track from its primary particle."""
+        start = np.array([primary.pos.x, primary.pos.y, primary.pos.z])
+        az = primary.dir.azimuth
+        ze = primary.dir.zenith
+        L = primary.length
+        # -1 because IceCube zenith/azimuth point toward the particle origin,
+        # not its direction of travel.
+        travel = -L * np.array([
+            np.cos(az) * np.sin(ze),
+            np.sin(az) * np.sin(ze),
+            np.cos(ze),
+        ])
+        return start + travel
 
     def _contained_vertex(self, truth: Dict[str, Any]) -> bool:
-        """Check whether an interaction vertex lies inside the detector volume.
-
-        Uses the Delaunay triangulation built from GCD sensor positions in
-        set_gcd().
-
-        Args:
-            truth: Dictionary of already extracted truth-level information.
-
-        Returns:
-            True if the vertex is inside the detector, False otherwise.
-        """
+        """Return True if position_x/y/z is inside the detector hull."""
         vertex = np.array(
             [truth["position_x"], truth["position_y"], truth["position_z"]]
         )
         return self.delaunay.find_simplex(vertex) >= 0
-
-

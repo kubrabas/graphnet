@@ -64,7 +64,7 @@ class GraphNeTFileReader(Logger, ABC):
         return self._accepted_extractors
 
     @property
-    def extracor_names(self) -> List[str]:
+    def extractor_names(self) -> List[str]:
         """Return list of table names produced by extractors."""
         return [extractor.name for extractor in self._extractors]
 
