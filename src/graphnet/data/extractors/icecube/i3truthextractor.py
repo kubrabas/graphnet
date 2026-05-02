@@ -544,7 +544,7 @@ class I3TruthExtractor(I3Extractor):
 
 
 
-
+## bu truth extractor'a acaba injection mode ekleyebilir miyim?
 
 class I3TruthExtractorPONE(I3Extractor):
     """Truth + injection parameter extractor for PONE simulations.
@@ -627,8 +627,8 @@ class I3TruthExtractorPONE(I3Extractor):
             "is_ending": padding_value,
             # EventProperties — per-event kinematics
             "totalEnergy": padding_value,
-            "zenith": padding_value,
-            "azimuth": padding_value,
+            "zenith": padding_value,       # unit: radian
+            "azimuth": padding_value,      # unit: radian
             "finalStateX": padding_value,
             "finalStateY": padding_value,
             "finalType1": padding_value,
