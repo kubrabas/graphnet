@@ -547,10 +547,9 @@ class I3TruthExtractor(I3Extractor):
 ## bu truth extractor'a acaba injection mode ekleyebilir miyim?
 
 class I3TruthExtractorPONE(I3Extractor):
-    """Truth + injection parameter extractor for PONE simulations.
+    """Truth extractor for PONE simulations.
 
-    Extracts per-event kinematics from EventProperties, injection configuration
-    from LeptonInjectorProperties, and the primary particle vertex from the
+    Extracts per-event kinematics from EventProperties, and the primary particle vertex from the
     MCTree.  Also computes two containment flags:
 
     - ``vertex_inside_detector_volume``: neutrino interaction vertex is inside the detector.
@@ -577,19 +576,39 @@ class I3TruthExtractorPONE(I3Extractor):
         self._mctree = mctree
         self._extend_boundary = extend_boundary
 
-    def set_gcd(self, i3_file: str, gcd_file: Optional[str] = None) -> None:
-        """Load GCD file and build the Delaunay hull for containment checks.
+
+    def set_gcd(self, gcd_file: Optional[str] = None) -> None:
+        """Extract GFrame from gcd-file.
+
 
         Args:
-            i3_file: Path to the i3 file being converted.
-            gcd_file: Path to the GCD file. If None, looks in i3_file.
+            gcd_file: Path to GCD file. Defaults to None. 
         """
-        super().set_gcd(i3_file=i3_file, gcd_file=gcd_file)
+
+        gcd = dataio.I3File(gcd_file)
+
+
+        # Get GFrame
+        try:
+            g_frame = gcd.pop_frame(icetray.I3Frame.Geometry)
+            # If the line above fails, it means that no gcd file was given
+        except RuntimeError as e:
+            self.error(
+                "No GCD file was provided "
+            )
+            raise e
+
+        
+        # Save information as member variables of I3Extractor
+        self._gcd_dict = g_frame["I3Geometry"].omgeo
+        if gcd_file is not None:
+            self._gcd_file = gcd_file
 
         coordinates = np.array([
             [g.position.x, g.position.y, g.position.z]
             for g in self._gcd_dict.values()
         ])
+
 
         if self._extend_boundary != 0.0:
             center = np.mean(coordinates, axis=0)
@@ -601,31 +620,45 @@ class I3TruthExtractorPONE(I3Extractor):
         self.hull = hull
         self.delaunay = Delaunay(coordinates[hull.vertices])
 
+
+    
     def __call__(
         self, frame: "icetray.I3Frame", padding_value: Any = -1
     ) -> Dict[str, Any]:
-        """Extract LeptonInjector truth and injection parameters."""
+        """Extract LeptonInjector truth parameters."""
         output = {
             # I3EventHeader
             "RunID": padding_value,
             "SubrunID": padding_value,
             "EventID": padding_value,
             "SubEventID": padding_value,
-            # Primary particle (from MCTree)
-            "position_x": padding_value,
-            "position_y": padding_value,
-            "position_z": padding_value,
+            # Primary particle (from MCTree) 
+            "position_x": padding_value,  ## bunu EventPulseSeries'dan alabilirsin bnc knk
+            "position_y": padding_value,  ## bunu EventPulseSeries'dan alabilirsin bnc knk
+            "position_z": padding_value,  ## bunu EventPulseSeries'dan alabilirsin bnc knk
             "pid": padding_value,
-            "interaction_type": padding_value,
-            "elasticity": padding_value,
-            # Containment flags
-            # vertex_inside_detector_volume: True if the neutrino interaction vertex lies inside
-            #              the instrumented detector volume
-            "vertex_inside_detector_volume": padding_value,
-            # is_ending: True if the muon track endpoint lies inside the
-            #            detector volume (muon events only)
-            "is_ending": padding_value,
-            # EventProperties — per-event kinematics
+            "interaction_type": padding_value,   ##??
+            "elasticity": padding_value,      ##??
+
+
+            # Containment flags:
+            "fully_contained":    ,
+                # Fully contained: the muon starts inside the detector and ends inside the detector.
+            "starting_track":    ,
+                # Starting track: the muon starts inside the detector and ends outside the detector.
+            "stopping_track":      ,
+                # Stopping track: the muon starts outside the detector and ends inside the detector.
+            "through_going":    ,
+                # Through-going track: the muon starts outside the detector and ends outside the detector, but passes through the detector.
+            "missed_track":     ,
+                # Missed track: the muon starts outside the detector and ends outside the detector, and does not pass through the detector.
+            "vertex_inside_detector_volume": padding_value,   ### this can be deleted?
+            "is_ending": padding_value,           ### this can be deleted?
+
+            ### bu genel hull mu ne bu nasil yaziliyo? bunun dogru hesaplaniyo olmasi onemli he.
+
+
+            # EventProperties - per-event kinematics
             "totalEnergy": padding_value,
             "zenith": padding_value,       # unit: radian
             "azimuth": padding_value,      # unit: radian
@@ -634,27 +667,17 @@ class I3TruthExtractorPONE(I3Extractor):
             "finalType1": padding_value,
             "finalType2": padding_value,
             "initialType": padding_value,
-            "totalColumnDepth": padding_value,  # ranged injection only
-            "impactParameter": padding_value,    # ranged injection only
-            # LeptonInjectorProperties — injection configuration
-            "EnergyMin": padding_value,
-            "EnergyMax": padding_value,
-            "ZenithMin": padding_value,
-            "ZenithMax": padding_value,
-            "AzimuthMin": padding_value,
-            "AzimuthMax": padding_value,
-            "PowerlawIndex": padding_value,
-            "InjectionRadius": padding_value,   # ranged only
-            "EndcapLength": padding_value,       # ranged only
-            "CylinderRadius": padding_value,     # volume only
-            "CylinderHeight": padding_value,     # volume only
+            "totalColumnDepth": padding_value,  # ranged injection only (not really)
+            "impactParameter": padding_value,    # ranged injection only. (not really)
+           
+       
         }
 
         if len(frame) == 0:
             print("[I3TruthExtractorPONE] Empty frame, skipping.")
             return output
 
-        required = ["I3EventHeader", "EventProperties", "LeptonInjectorProperties"]
+        required = ["I3EventHeader", "EventProperties"]
         missing = [k for k in required if k not in frame]
         if missing:
             print(
@@ -695,24 +718,6 @@ class I3TruthExtractorPONE(I3Extractor):
         except AttributeError:
             pass  # volume injection — these fields don't exist
 
-        # LeptonInjectorProperties
-        props = frame["LeptonInjectorProperties"]
-        is_ranged = hasattr(props, "injectionRadius")
-        output.update(
-            {
-                "EnergyMin": props.energyMinimum,
-                "EnergyMax": props.energyMaximum,
-                "ZenithMin": props.zenithMinimum,
-                "ZenithMax": props.zenithMaximum,
-                "AzimuthMin": props.azimuthMinimum,
-                "AzimuthMax": props.azimuthMaximum,
-                "PowerlawIndex": props.powerlawIndex,
-                "InjectionRadius": props.injectionRadius if is_ranged else padding_value,
-                "EndcapLength": props.endcapLength if is_ranged else padding_value,
-                "CylinderRadius": props.cylinderRadius if not is_ranged else padding_value,
-                "CylinderHeight": props.cylinderHeight if not is_ranged else padding_value,
-            }
-        )
 
         # Primary particle position and PID from MCTree
         if self._mctree in frame:
@@ -767,3 +772,5 @@ class I3TruthExtractorPONE(I3Extractor):
             [truth["position_x"], truth["position_y"], truth["position_z"]]
         )
         return self.delaunay.find_simplex(vertex) >= 0
+
+        
