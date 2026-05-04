@@ -8,6 +8,7 @@ from graphnet.data.extractors.icecube.utilities.frames import (
 )
 from graphnet.utilities.imports import has_icecube_package
 
+
 if has_icecube_package() or TYPE_CHECKING:
     from icecube import icetray, dataio  # pyright: reportMissingImports=false
 
@@ -46,8 +47,8 @@ class I3FeatureExtractorPONE(I3Extractor):
         self._extractor_name = name
 
 
-        # are these angles correct?
-        self._PMT_ANGLES = np.array(
+        # PMT angles (elevation, azimuth) in degrees, as defined in POMModel (pone_offline v2)
+        pmt_angles = np.array(
             [
                 [57.5, 270.],   # PMT 1
                 [57.5, 0.],     # PMT 2
@@ -68,46 +69,26 @@ class I3FeatureExtractorPONE(I3Extractor):
             ]
         )
 
-        ## check this as well.
-        self.MODULE_RADIUS_M = 0.2159
+        # valid in both mc production campaigns
+        module_radius_m = 0.2159
 
-        self._pmt_x_coordinates_wrt_om_rotated = np.multiply(
-            np.sin(np.deg2rad(90.0 - self._PMT_ANGLES[:, 0])),
-            np.cos(np.deg2rad(self._PMT_ANGLES[:, 1])),
-        )
-        self._pmt_y_coordinates_wrt_om_rotated = np.multiply(
-            np.sin(np.deg2rad(90.0 - self._PMT_ANGLES[:, 0])),
-            np.sin(np.deg2rad(self._PMT_ANGLES[:, 1])),
-        )
-        self._pmt_z_coordinates_wrt_om_rotated = np.cos(
-            np.deg2rad(90.0 - self._PMT_ANGLES[:, 0])
-        )
-
-        self._PMT_MATRIX_rotated = np.array(
+        pmt_matrix_pom_frame = np.array(
             [
-                self._pmt_x_coordinates_wrt_om_rotated,
-                self._pmt_y_coordinates_wrt_om_rotated,
-                self._pmt_z_coordinates_wrt_om_rotated,
+                np.multiply(np.sin(np.deg2rad(90.0 - pmt_angles[:, 0])), np.cos(np.deg2rad(pmt_angles[:, 1]))),
+                np.multiply(np.sin(np.deg2rad(90.0 - pmt_angles[:, 0])), np.sin(np.deg2rad(pmt_angles[:, 1]))),
+                np.cos(np.deg2rad(90.0 - pmt_angles[:, 0])),
             ]
         ).T
 
-        self._PMT_COORDINATES_rotated = (
-            self._PMT_MATRIX_rotated * self.MODULE_RADIUS_M
-        )
-
-        self._minus_90_degree_rotation_around_x_axis = np.array(
-            [
-                [1.000000e00, 0.000000e00, 0.000000e00],
-                [0.000000e00, 0.000000e00, 1.000000e00],
-                [0.000000e00, -1.000000e00, 0.000000e00],
-            ],
+        # rotate from POM frame back to world frame (inverse of R_x(+90°) used in POMModel)
+        r_x_minus_90 = np.array(
+            [[1., 0.,  0.],
+             [0., 0.,  1.],
+             [0., -1., 0.]],
             dtype=float,
         )
 
-        self._PMT_COORDINATES_ORIGINAL = (
-            self._PMT_COORDINATES_rotated
-            @ self._minus_90_degree_rotation_around_x_axis.T
-        )
+        self._PMT_COORDINATES_ORIGINAL = (pmt_matrix_pom_frame * module_radius_m) @ r_x_minus_90.T
 
     def set_gcd(self, gcd_file: Optional[str] = None) -> None:
         """Extract GFrame from gcd-file.
@@ -131,8 +112,11 @@ class I3FeatureExtractorPONE(I3Extractor):
             raise e
 
         
-        # Save information as member variables of I3Extractor
-        self._gcd_dict = g_frame["I3Geometry"].omgeo
+        module_geo = g_frame["I3ModuleGeoMap"]
+        self._module_geo_dict = {
+            (mod_key[0], mod_key[1]): module_geo[mod_key]
+            for mod_key in module_geo
+        }
         if gcd_file is not None:
             self._gcd_file = gcd_file
 
@@ -143,16 +127,12 @@ class I3FeatureExtractorPONE(I3Extractor):
         output: Dict[str, List[Any]] = {
             "charge": [],
             "dom_time": [],
-            "width": [],
             "dom_x": [],
             "dom_y": [],
             "dom_z": [],
-            "pmt_area": [],
-            "event_time": [],
-            "string": [],
+            "string_number": [],
             "pmt_number": [],
             "dom_number": [],
-            "dom_type": [],
             "pmt_x": [],
             "pmt_y": [],
             "pmt_z": [],
@@ -172,19 +152,16 @@ class I3FeatureExtractorPONE(I3Extractor):
 
 
         
-        event_time = frame["I3EventHeader"].start_time.mod_julian_day_double
 
         for om_key in om_keys:
-            x = self._gcd_dict[om_key].position.x
-            y = self._gcd_dict[om_key].position.y
-            z = self._gcd_dict[om_key].position.z
-            area = self._gcd_dict[om_key].area
-           
-
-            string = om_key[0]
+            string_number = om_key[0]
             dom_number = om_key[1]
             pmt_number = om_key[2]
-            dom_type = self._gcd_dict[om_key].omtype
+
+            mod = self._module_geo_dict[(string_number, dom_number)]
+            x = mod.pos.x
+            y = mod.pos.y
+            z = mod.pos.z
 
             pmt_x = pmt_y = pmt_z = padding_value
             if pmt_number is not None:
@@ -205,8 +182,6 @@ class I3FeatureExtractorPONE(I3Extractor):
                 output["dom_time"].append(
                     getattr(pulse, "time", padding_value)
                 )
-                output["width"].append(getattr(pulse, "width", padding_value))
-                output["pmt_area"].append(area)
                 output["dom_x"].append(x)
                 output["dom_y"].append(y)
                 output["dom_z"].append(z)
@@ -214,12 +189,10 @@ class I3FeatureExtractorPONE(I3Extractor):
                 output["pmt_y"].append(pmt_y)
                 output["pmt_z"].append(pmt_z)
 
-                output["string"].append(string)
+                output["string_number"].append(string_number)
                 output["pmt_number"].append(pmt_number)
                 output["dom_number"].append(dom_number)
-                output["dom_type"].append(dom_type)
 
-                output["event_time"].append(event_time)
 
               
         return output
