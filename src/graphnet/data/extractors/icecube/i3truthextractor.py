@@ -22,7 +22,6 @@ if has_icecube_package() or TYPE_CHECKING:
     )  # pyright: reportMissingImports=false
 
 
-#### check if the truth extractor correct as you want
 
 class I3TruthExtractor(I3Extractor):
     """Class for extracting truth-level information."""
@@ -543,23 +542,75 @@ class I3TruthExtractor(I3Extractor):
 
 
 
-
-## bu truth extractor'a acaba injection mode ekleyebilir miyim?
-
+#### check if the truth extractor correct as you want:
 class I3TruthExtractorPONE(I3Extractor):
-    """Truth extractor for PONE simulations.
+    """Truth extractor for PONE/LeptonInjector simulations.
 
-    Extracts per-event kinematics from EventProperties, and the primary particle vertex from the
-    MCTree.  Also computes two containment flags:
+    Extracts per-event kinematics from EventProperties and computes five
+    mutually exclusive muon track containment flags for NuMu/NuMuBar CC events.
 
-    - ``vertex_inside_detector_volume``: neutrino interaction vertex is inside the detector.
-    - ``is_ending``:   muon track endpoint is inside the detector (muon only).
+    All containment flags describe the muon's path relative to the detector
+    convex hull (built from the GCD file passed to ``set_gcd``).
+
+    ---
+
+    Coordinate sources
+    ------------------
+    ``ep.x / ep.y / ep.z``  (from ``EventProperties``)
+        The neutrino interaction vertex — equivalently, the point where the
+        muon is born.  Used as the muon's **birth position**.
+
+    ``mmc.xi / mmc.yi / mmc.zi``  (from ``MMCTrackList``)
+        The point where the muon crosses into the PROPOSAL simulation
+        cylinder.  This cylinder is defined around the *full* detector
+        geometry used in the simulation, which may be larger than the
+        sub-geometry GCD hull used here.  Used only for the
+        ``through_going`` segment sampling (not for containment checks).
+
+    ``mmc.xf / mmc.yf / mmc.zf``  (from ``MMCTrackList``)
+        Either the muon's **actual stopping point** (if it runs out of
+        energy inside the PROPOSAL cylinder) or the point where it
+        **exits** the PROPOSAL cylinder (if it is still energetic).
+        In both cases, checking this point against the detector hull
+        correctly answers "did the muon stop inside the detector?":
+        a stopped muon gives its true final position; a cylinder-exiting
+        muon gives a point that is outside the (smaller) detector hull.
+        Used as the muon's **end position**.
+
+    ---
+
+    Containment flags  (NuMu / NuMuBar CC only)
+    --------------------------------------------
+    All flags are binary (0 or 1) and mutually exclusive.
+    They are set to the padding value (-1) for non-NuMu events or
+    when ``MMCTrackList`` is absent from the frame.
+
+    ``fully_contained``
+        birth inside detector  AND  end inside detector.
+        The muon is created and stops entirely within the hull.
+
+    ``starting_track``
+        birth inside detector  AND  end outside detector.
+        The muon is created inside the hull but exits before stopping.
+
+    ``stopping_track``
+        birth outside detector  AND  end inside detector.
+        The muon enters the hull from outside and stops inside.
+
+    ``through_going``
+        birth outside detector  AND  end outside detector
+        AND the MMC segment (xi→xf) intersects the hull.
+        The muon passes through the hull without stopping inside.
+
+    ``missed_track``
+        birth outside detector  AND  end outside detector
+        AND the MMC segment (xi→xf) does not intersect the hull.
+        The muon never enters the detector volume.
     """
 
     def __init__(
         self,
         name: str = "truth",
-        mctree: Optional[str] = "I3MCTree",
         extend_boundary: Optional[float] = 0.0,
         exclude: list = [None],
     ):
@@ -567,13 +618,11 @@ class I3TruthExtractorPONE(I3Extractor):
 
         Args:
             name: Name of the `I3Extractor` instance.
-            mctree: Name of the MC tree used to read the primary particle.
             extend_boundary: Distance in metres to expand the convex hull of
                 the detector when testing vertex containment. Defaults to 0.
             exclude: List of keys to exclude from the extracted data.
         """
         super().__init__(name, exclude=exclude)
-        self._mctree = mctree
         self._extend_boundary = extend_boundary
 
 
@@ -625,50 +674,35 @@ class I3TruthExtractorPONE(I3Extractor):
     def __call__(
         self, frame: "icetray.I3Frame", padding_value: Any = -1
     ) -> Dict[str, Any]:
-        """Extract LeptonInjector truth parameters."""
+        """Extract truth-level information for a single DAQ frame."""
         output = {
             # I3EventHeader
-            "RunID": padding_value,
-            "SubrunID": padding_value,
-            "EventID": padding_value,
+            "RunID":      padding_value,
+            "SubrunID":   padding_value,
+            "EventID":    padding_value,
             "SubEventID": padding_value,
-            # Primary particle (from MCTree) 
-            "position_x": padding_value,  ## bunu EventProperties'dan alabilirsin bnc knk
-            "position_y": padding_value,  ## bunu EventProperties'dan alabilirsin bnc knk
-            "position_z": padding_value,  ## bunu EventProperties'dan alabilirsin bnc knk
-            "pid": padding_value,
-            "interaction_type": padding_value,   ##??
-            "elasticity": padding_value,      ##??
-
-
-            # Containment flags:
-            "fully_contained": padding_value   ,
-                # Fully contained: the muon starts inside the detector and ends inside the detector.
-            "starting_track":  padding_value  ,
-                # Starting track: the muon starts inside the detector and ends outside the detector.
-            "stopping_track":  padding_value    ,
-                # Stopping track: the muon starts outside the detector and ends inside the detector.
-            "through_going":  padding_value  ,
-                # Through-going track: the muon starts outside the detector and ends outside the detector, but passes through the detector.
-            "missed_track":    padding_value ,
-                # Missed track: the muon starts outside the detector and ends outside the detector, and does not pass through the detector.
-
-            ### bu genel hull mu ne bu nasil yaziliyo? bunun dogru hesaplaniyo olmasi onemli he.
-
-
-            # EventProperties - per-event kinematics
-            "totalEnergy": padding_value,
-            "zenith": padding_value,       # unit: radian
-            "azimuth": padding_value,      # unit: radian
-            "finalStateX": padding_value,
-            "finalStateY": padding_value,
-            "finalType1": padding_value,
-            "finalType2": padding_value,
-            "initialType": padding_value,
-            "totalColumnDepth": padding_value,  # ranged injection only (not really)
-            "impactParameter": padding_value,    # ranged injection only. (not really)
-           
-       
+            # EventProperties
+            "position_x":       padding_value,
+            "position_y":       padding_value,
+            "position_z":       padding_value,
+            "pid":              padding_value,
+            "interaction_type": padding_value,
+            "totalEnergy":      padding_value,
+            "zenith":           padding_value,
+            "azimuth":          padding_value,
+            "finalStateX":      padding_value,
+            "finalStateY":      padding_value,
+            "finalType1":       padding_value,
+            "finalType2":       padding_value,
+            "initialType":      padding_value,
+            "totalColumnDepth": padding_value,
+            "impactParameter":  padding_value,
+            # Muon containment flags (NuMu/NuMuBar CC only — see class docstring)
+            "fully_contained": padding_value,
+            "starting_track":  padding_value,
+            "stopping_track":  padding_value,
+            "through_going":   padding_value,
+            "missed_track":    padding_value,
         }
 
         if len(frame) == 0:
@@ -698,6 +732,10 @@ class I3TruthExtractorPONE(I3Extractor):
         ep = frame["EventProperties"]
         output.update(
             {
+                "position_x": ep.x,
+                "position_y": ep.y,
+                "position_z": ep.z,
+                "pid": int(ep.initialType),
                 "totalEnergy": ep.totalEnergy,
                 "zenith": ep.zenith,
                 "azimuth": ep.azimuth,
@@ -707,30 +745,45 @@ class I3TruthExtractorPONE(I3Extractor):
                 "finalType2": ep.finalType2,
                 "initialType": ep.initialType,
                 "interaction_type": self._get_interaction_type(ep),
-                "elasticity": 1 - ep.finalStateY,
             }
         )
         try:
             output["totalColumnDepth"] = ep.totalColumnDepth
             output["impactParameter"] = ep.impactParameter
         except AttributeError:
-            pass  # volume injection — these fields don't exist
+            pass  
 
+        # Containment flags — only for NuMu/NuMuBar CC events (muon tracks)
+        if abs(int(ep.initialType)) == 14:
+            mmc_list = frame["MMCTrackList"] if "MMCTrackList" in frame else []
 
-        # Primary particle position and PID from MCTree
-        if self._mctree in frame:
-            primary = frame[self._mctree].primaries[0]
-            output.update(
-                {
-                    "position_x": primary.pos.x,
-                    "position_y": primary.pos.y,
-                    "position_z": primary.pos.z,
-                    "pid": primary.pdg_encoding,
-                }
-            )
+            if len(mmc_list) > 0:
+                mmc = mmc_list[0]
+                birth  = np.array([ep.x, ep.y, ep.z])
+                mmc_entry = np.array([mmc.xi, mmc.yi, mmc.zi])
+                end    = np.array([mmc.xf, mmc.yf, mmc.zf])
 
+                birth_inside = self._inside_detector(birth)
+                end_inside   = self._inside_detector(end)
 
-            
+                through_going, missed_track = 0, 0
+                if not birth_inside and not end_inside:
+                    passes = any(
+                        self._inside_detector(mmc_entry + t * (end - mmc_entry))
+                        for t in np.linspace(0, 1, 100)
+                    )
+                    through_going = int(passes)
+                    missed_track  = int(not passes)
+
+                output.update(
+                    {
+                        "fully_contained": int(birth_inside and end_inside),
+                        "starting_track":  int(birth_inside and not end_inside),
+                        "stopping_track":  int(not birth_inside and end_inside),
+                        "through_going":   through_going,
+                        "missed_track":    missed_track,
+                    }
+                )
 
         return output
 
@@ -746,26 +799,6 @@ class I3TruthExtractorPONE(I3Extractor):
         ]
         return 2 if ep.finalType1 in neutrinos else 1
 
-    def _muon_end_position(self, primary: Any) -> np.ndarray:
-        """Compute the 3D endpoint of a muon track from its primary particle."""
-        start = np.array([primary.pos.x, primary.pos.y, primary.pos.z])
-        az = primary.dir.azimuth
-        ze = primary.dir.zenith
-        L = primary.length
-        # -1 because IceCube zenith/azimuth point toward the particle origin,
-        # not its direction of travel.
-        travel = -L * np.array([
-            np.cos(az) * np.sin(ze),
-            np.sin(az) * np.sin(ze),
-            np.cos(ze),
-        ])
-        return start + travel
-
-    def _contained_vertex(self, truth: Dict[str, Any]) -> bool:
-        """Return True if position_x/y/z is inside the detector hull."""
-        vertex = np.array(
-            [truth["position_x"], truth["position_y"], truth["position_z"]]
-        )
-        return self.delaunay.find_simplex(vertex) >= 0
-
-        
+    def _inside_detector(self, point: np.ndarray) -> bool:
+        """Return True if point is inside the detector convex hull."""
+        return bool(self.delaunay.find_simplex(point) >= 0)
