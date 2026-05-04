@@ -219,22 +219,70 @@ class PONE_Reader(GraphNeTFileReader):
         for extractor in self._extractors:
             assert isinstance(extractor, I3Extractor)
             extractor.set_gcd(
-                i3_file=file_path.i3_file, gcd_file=file_path.gcd_file
+                gcd_file=file_path.gcd_file
             )
 
-        i3_file_io = dataio.I3File(file_path.i3_file, "r")
-        data = list()
+        try:
+            i3_file_io = dataio.I3File(file_path.i3_file, "r")
+        except Exception as e:
+            print(f"[FILE ERROR] Could not open: {file_path.i3_file}  error={e}")
+            return []
+
+        data: List[OrderedDict] = []
+        triggered_by_only_noise: List[str] = []
+        corrupt_frame_count = 0
+
         while i3_file_io.more():
             try:
                 frame = i3_file_io.pop_daq()
             except Exception:
+                corrupt_frame_count += 1
                 continue
-            if self._skip_frame(frame):
+
+            # Apply I3 filters (e.g. NullSplitI3Filter)
+            if self._i3filters and any(not f(frame) for f in self._i3filters):
+                continue
+
+            # Check pulsemap; log frames dropped due to empty/absent pulsemap
+            pulsemap_absent = self._pulsemap not in frame
+            pulsemap_empty = False
+            if not pulsemap_absent and self._skip_empty_pulses:
+                pmap = frame[self._pulsemap]
+                try:
+                    pulsemap_empty = len(pmap) == 0
+                except TypeError:
+                    try:
+                        pulsemap_empty = len(list(pmap.keys())) == 0
+                    except Exception:
+                        pass
+
+            if pulsemap_absent or pulsemap_empty:
+                if frame.Has("I3EventHeader"):
+                    hdr = frame["I3EventHeader"]
+                    triggered_by_only_noise.append(
+                        f"RunID={hdr.run_id}, SubRunID={hdr.sub_run_id}, "
+                        f"EventID={hdr.event_id}, SubEventID={hdr.sub_event_id}"
+                    )
                 continue
 
             results = [extractor(frame) for extractor in self._extractors]
             data_dict = OrderedDict(zip(self.extractor_names, results))
             data.append(data_dict)
+
+        if triggered_by_only_noise:
+            print(
+                "Events assumed to be pure noise (triggered by noise, "
+                "removed by noise cleaning):"
+            )
+            for entry in triggered_by_only_noise:
+                print(f"  {entry}")
+
+        if corrupt_frame_count > 0:
+            print(
+                f"[WARN] {corrupt_frame_count} corrupt frame(s) in "
+                f"{file_path.i3_file} (IDs unavailable)"
+            )
+
         return data
 
     def find_files(self, path: Union[str, List[str]]) -> List[I3FileSet]:
@@ -285,3 +333,6 @@ class PONE_Reader(GraphNeTFileReader):
                     pass
 
         return False
+
+
+

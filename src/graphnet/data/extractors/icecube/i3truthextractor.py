@@ -633,27 +633,25 @@ class I3TruthExtractorPONE(I3Extractor):
             "EventID": padding_value,
             "SubEventID": padding_value,
             # Primary particle (from MCTree) 
-            "position_x": padding_value,  ## bunu EventPulseSeries'dan alabilirsin bnc knk
-            "position_y": padding_value,  ## bunu EventPulseSeries'dan alabilirsin bnc knk
-            "position_z": padding_value,  ## bunu EventPulseSeries'dan alabilirsin bnc knk
+            "position_x": padding_value,  ## bunu EventProperties'dan alabilirsin bnc knk
+            "position_y": padding_value,  ## bunu EventProperties'dan alabilirsin bnc knk
+            "position_z": padding_value,  ## bunu EventProperties'dan alabilirsin bnc knk
             "pid": padding_value,
             "interaction_type": padding_value,   ##??
             "elasticity": padding_value,      ##??
 
 
             # Containment flags:
-            "fully_contained":    ,
+            "fully_contained": padding_value   ,
                 # Fully contained: the muon starts inside the detector and ends inside the detector.
-            "starting_track":    ,
+            "starting_track":  padding_value  ,
                 # Starting track: the muon starts inside the detector and ends outside the detector.
-            "stopping_track":      ,
+            "stopping_track":  padding_value    ,
                 # Stopping track: the muon starts outside the detector and ends inside the detector.
-            "through_going":    ,
+            "through_going":  padding_value  ,
                 # Through-going track: the muon starts outside the detector and ends outside the detector, but passes through the detector.
-            "missed_track":     ,
+            "missed_track":    padding_value ,
                 # Missed track: the muon starts outside the detector and ends outside the detector, and does not pass through the detector.
-            "vertex_inside_detector_volume": padding_value,   ### this can be deleted?
-            "is_ending": padding_value,           ### this can be deleted?
 
             ### bu genel hull mu ne bu nasil yaziliyo? bunun dogru hesaplaniyo olmasi onemli he.
 
@@ -731,11 +729,8 @@ class I3TruthExtractorPONE(I3Extractor):
                 }
             )
 
-            output["vertex_inside_detector_volume"] = self._contained_vertex(output)
 
-            if abs(output["pid"]) == 13:
-                end_pos = self._muon_end_position(primary)
-                output["is_ending"] = self.delaunay.find_simplex(end_pos) >= 0
+            
 
         return output
 

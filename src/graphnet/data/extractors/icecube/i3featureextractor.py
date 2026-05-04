@@ -1,6 +1,7 @@
 """I3Extractor class(es) for extracting specific, reconstructed features."""
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+import numpy as np
 from .i3extractor import I3Extractor
 from graphnet.data.extractors.icecube.utilities.frames import (
     get_om_keys_and_pulseseries,
@@ -38,15 +39,14 @@ class I3FeatureExtractorPONE(I3Extractor):
         name: str = "feature",
         exclude: list = [None],
     ):
-        # keep same behavior / naming as your current class
         self._pulsemap = pulsemap
 
         # Base class constructor
-        super().__init__(name=name, exclude=exclude)
+        super().__init__(extractor_name=name, exclude=exclude)
         self._extractor_name = name
 
-        self._detector_status: Optional["icetray.I3Frame.DetectorStatus"] = None
 
+        # are these angles correct?
         self._PMT_ANGLES = np.array(
             [
                 [57.5, 270.],   # PMT 1
@@ -68,6 +68,7 @@ class I3FeatureExtractorPONE(I3Extractor):
             ]
         )
 
+        ## check this as well.
         self.MODULE_RADIUS_M = 0.2159
 
         self._pmt_x_coordinates_wrt_om_rotated = np.multiply(
@@ -108,29 +109,33 @@ class I3FeatureExtractorPONE(I3Extractor):
             @ self._minus_90_degree_rotation_around_x_axis.T
         )
 
-    def set_gcd(self, i3_file: str, gcd_file: Optional[str] = None) -> None:
-        """Extract GFrame, CFrame and DFrame from i3/gcd-file pair.
+    def set_gcd(self, gcd_file: Optional[str] = None) -> None:
+        """Extract GFrame from gcd-file.
 
-        Information from these frames will be set as member variables of
-        `I3Extractor`.
+
+        Args:
+            gcd_file: Path to GCD file. Defaults to None. 
         """
-        super().set_gcd(i3_file=i3_file, gcd_file=gcd_file)
 
-        if gcd_file is None:
-            gcd = dataio.I3File(i3_file)
-        else:
-            gcd = dataio.I3File(gcd_file)
+        gcd = dataio.I3File(gcd_file)
 
+
+        # Get GFrame
         try:
-            d_frame = gcd.pop_frame(icetray.I3Frame.DetectorStatus)
+            g_frame = gcd.pop_frame(icetray.I3Frame.Geometry)
+            # If the line above fails, it means that no gcd file was given
         except RuntimeError as e:
             self.error(
                 "No GCD file was provided "
-                f"and no D-frame was found in {i3_file.split('/')[-1]}."
             )
             raise e
 
-        self._detector_status = d_frame
+        
+        # Save information as member variables of I3Extractor
+        self._gcd_dict = g_frame["I3Geometry"].omgeo
+        if gcd_file is not None:
+            self._gcd_file = gcd_file
+
 
     def __call__(self, frame: "icetray.I3Frame") -> Dict[str, List[Any]]:
         """Extract reconstructed features from `frame`."""
@@ -143,14 +148,7 @@ class I3FeatureExtractorPONE(I3Extractor):
             "dom_y": [],
             "dom_z": [],
             "pmt_area": [],
-            "rde": [],
-            "is_bright_dom": [],
-            "is_bad_dom": [],
-            "is_saturated_dom": [],
-            "is_errata_dom": [],
             "event_time": [],
-            "hlc": [],
-            "awtd": [],
             "string": [],
             "pmt_number": [],
             "dom_number": [],
@@ -171,16 +169,9 @@ class I3FeatureExtractorPONE(I3Extractor):
             self.warning_once(f"Pulsemap {self._pulsemap} not found in frame.")
             return output
 
-        # keep same behavior as your current class
-        is_bright_dom = -1
-        is_saturated_dom = -1
-        is_errata_dom = -1
 
-        bad_doms = None
-        if self._detector_status is not None:
-            if "BadDomsList" in self._detector_status:
-                bad_doms = self._detector_status["BadDomsList"]
 
+        
         event_time = frame["I3EventHeader"].start_time.mod_julian_day_double
 
         for om_key in om_keys:
@@ -188,9 +179,7 @@ class I3FeatureExtractorPONE(I3Extractor):
             y = self._gcd_dict[om_key].position.y
             z = self._gcd_dict[om_key].position.z
             area = self._gcd_dict[om_key].area
-            rde = self._get_relative_dom_efficiency(
-                frame, om_key, padding_value
-            )
+           
 
             string = om_key[0]
             dom_number = om_key[1]
@@ -206,10 +195,7 @@ class I3FeatureExtractorPONE(I3Extractor):
                     pmt_y = y + float(rel[1])
                     pmt_z = z + float(rel[2])
 
-            if bad_doms:
-                is_bad_dom = 1 if om_key in bad_doms else 0
-            else:
-                is_bad_dom = int(padding_value)
+  
 
             pulses = data[om_key]
             for pulse in pulses:
@@ -221,7 +207,6 @@ class I3FeatureExtractorPONE(I3Extractor):
                 )
                 output["width"].append(getattr(pulse, "width", padding_value))
                 output["pmt_area"].append(area)
-                output["rde"].append(rde)
                 output["dom_x"].append(x)
                 output["dom_y"].append(y)
                 output["dom_z"].append(z)
@@ -234,46 +219,12 @@ class I3FeatureExtractorPONE(I3Extractor):
                 output["dom_number"].append(dom_number)
                 output["dom_type"].append(dom_type)
 
-                output["is_bad_dom"].append(is_bad_dom)
                 output["event_time"].append(event_time)
-                output["is_bright_dom"].append(is_bright_dom)
-                output["is_errata_dom"].append(is_errata_dom)
-                output["is_saturated_dom"].append(is_saturated_dom)
 
-                flags = getattr(pulse, "flags", padding_value)
-                if flags == padding_value:
-                    output["hlc"].append(padding_value)
-                    output["awtd"].append(padding_value)
-                else:
-                    output["hlc"].append((pulse.flags >> 0) & 0x1)
-                    output["awtd"].append(self._parse_awtd_flag(pulse))
-
+              
         return output
 
-    def _get_relative_dom_efficiency(
-        self,
-        frame: "icetray.I3Frame",
-        om_key: int,
-        padding_value: float,
-    ) -> float:
-        if "I3Calibration" in frame:
-            rde = frame["I3Calibration"].dom_cal[om_key].relative_dom_eff
-        else:
-            try:
-                assert self._calibration is not None
-                rde = self._calibration.dom_cal[om_key].relative_dom_eff
-            except:  # noqa: E722
-                rde = padding_value
-        return rde
-
-    def _parse_awtd_flag(
-        self,
-        pulse: Any,
-        fadc_min_width_ns: float = 6.0,
-    ) -> bool:
-        """Parse awtd flag from pulse width."""
-        return pulse.width < (fadc_min_width_ns * icetray.I3Units.ns)
-
+    
 
 class I3FeatureExtractorIceCube86(I3FeatureExtractor):
     """Class for extracting reconstructed features for IceCube-86."""
@@ -550,4 +501,4 @@ class I3PulseNoiseTruthFlagIceCubeUpgrade(I3FeatureExtractorIceCube86):
 
 
 
-## ToDo: check if the hardcoded angles are correct.
+## ToDo: check if the hardcoded angles are correct. and if this pmt posn logic is correct.
