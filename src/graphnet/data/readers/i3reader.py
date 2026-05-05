@@ -1,5 +1,6 @@
 """Module containing different I3Reader."""
 
+import os
 from typing import List, Union, OrderedDict, Optional, Any, Dict
 
 from graphnet.utilities.imports import has_icecube_package
@@ -128,7 +129,7 @@ class I3Reader(GraphNeTFileReader):
         filesets = []
         for i3_file, gcd_file in zip(i3_files, gcd_files):
             assert isinstance(i3_file, str)
-            assert isinstance(gcd_file, str), print(gcd_file, self._gcd_rescue)
+            assert isinstance(gcd_file, str), f"Expected str, got {type(gcd_file)}: {gcd_file}"
             filesets.append(I3FileSet(i3_file, gcd_file))
 
         return filesets
@@ -163,7 +164,7 @@ class PONE_Reader(GraphNeTFileReader):
         gcd_rescue: str,
         i3_filters: Optional[Union[I3Filter, List[I3Filter]]] = None,
         icetray_verbose: int = 0,
-        pulsemap: str = "EventPulseSeries",
+        pulsemap: str = "EventPulseSeries_nonoise",
         skip_empty_pulses: bool = True,
     ):
         """Initialize `PONE_Reader`.
@@ -181,7 +182,7 @@ class PONE_Reader(GraphNeTFileReader):
             icetray_verbose: Set the level of verbosity of icetray.
                              Defaults to 0.
             pulsemap: Name of the pulse series map to check for emptiness.
-                      Defaults to 'EventPulseSeries'.
+                      Defaults to 'EventPulseSeries_nonoise'.
             skip_empty_pulses: If True, skip frames where the pulsemap is
                                missing or empty. Defaults to True.
         """
@@ -229,25 +230,35 @@ class PONE_Reader(GraphNeTFileReader):
             return []
 
         data: List[OrderedDict] = []
-        triggered_by_only_noise: List[str] = []
-        corrupt_frame_count = 0
+        noise_only_events: List[str] = []
+        absent_pulsemap_events: List[str] = []
+        corrupt_frames = 0  # frames that could not be read (not corrupt files)
 
         while i3_file_io.more():
             try:
                 frame = i3_file_io.pop_daq()
             except Exception:
-                corrupt_frame_count += 1
+                corrupt_frames += 1
                 continue
 
             # Apply I3 filters (e.g. NullSplitI3Filter)
             if self._i3filters and any(not f(frame) for f in self._i3filters):
                 continue
 
-            # Check pulsemap; log frames dropped due to empty/absent pulsemap
-            pulsemap_absent = self._pulsemap not in frame
-            pulsemap_empty = False
-            if not pulsemap_absent and self._skip_empty_pulses:
+            def _event_id(f: "icetray.I3Frame") -> str:
+                if f.Has("I3EventHeader"):
+                    hdr = f["I3EventHeader"]
+                    return (f"RunID={hdr.run_id} SubRunID={hdr.sub_run_id} "
+                            f"EventID={hdr.event_id} SubEventID={hdr.sub_event_id}")
+                return "unknown"
+
+            if self._pulsemap not in frame:
+                absent_pulsemap_events.append(_event_id(frame))
+                continue
+
+            if self._skip_empty_pulses:
                 pmap = frame[self._pulsemap]
+                pulsemap_empty = False
                 try:
                     pulsemap_empty = len(pmap) == 0
                 except TypeError:
@@ -255,33 +266,32 @@ class PONE_Reader(GraphNeTFileReader):
                         pulsemap_empty = len(list(pmap.keys())) == 0
                     except Exception:
                         pass
-
-            if pulsemap_absent or pulsemap_empty:
-                if frame.Has("I3EventHeader"):
-                    hdr = frame["I3EventHeader"]
-                    triggered_by_only_noise.append(
-                        f"RunID={hdr.run_id}, SubRunID={hdr.sub_run_id}, "
-                        f"EventID={hdr.event_id}, SubEventID={hdr.sub_event_id}"
-                    )
-                continue
+                if pulsemap_empty:
+                    noise_only_events.append(_event_id(frame))
+                    continue
 
             results = [extractor(frame) for extractor in self._extractors]
             data_dict = OrderedDict(zip(self.extractor_names, results))
             data.append(data_dict)
 
-        if triggered_by_only_noise:
-            print(
-                "Events assumed to be pure noise (triggered by noise, "
-                "removed by noise cleaning):"
-            )
-            for entry in triggered_by_only_noise:
-                print(f"  {entry}")
+        fname = os.path.basename(file_path.i3_file)
 
-        if corrupt_frame_count > 0:
-            print(
-                f"[WARN] {corrupt_frame_count} corrupt frame(s) in "
-                f"{file_path.i3_file} (IDs unavailable)"
-            )
+        if absent_pulsemap_events:
+            print(f"absent_pulsemap events ({len(absent_pulsemap_events)}):")
+            for eid in absent_pulsemap_events:
+                print(f"  {eid}")
+
+        if noise_only_events:
+            print(f"noise_only events ({len(noise_only_events)}):")
+            for eid in noise_only_events:
+                print(f"  {eid}")
+
+        print(
+            f"[{fname}] kept={len(data)}"
+            f"  noise_only={len(noise_only_events)}"
+            f"  absent_pulsemap={len(absent_pulsemap_events)}"
+            f"  corrupt_frames={corrupt_frames}"
+        )
 
         return data
 
@@ -303,36 +313,11 @@ class PONE_Reader(GraphNeTFileReader):
         filesets = []
         for i3_file, gcd_file in zip(i3_files, gcd_files):
             assert isinstance(i3_file, str)
-            assert isinstance(gcd_file, str), print(gcd_file, self._gcd_rescue)
+            assert isinstance(gcd_file, str), f"Expected str, got {type(gcd_file)}: {gcd_file}"
             filesets.append(I3FileSet(i3_file, gcd_file))
 
         return filesets
 
-    def _skip_frame(self, frame: "icetray.I3Frame") -> bool:
-        """Skip frame if filters fail or pulsemap is missing/empty."""
-        if self._i3filters is None:
-            return False
-
-        for filter in self._i3filters:
-            if not filter(frame):
-                return True
-
-        if self._pulsemap not in frame:
-            return True
-
-        if self._skip_empty_pulses:
-            pmap = frame[self._pulsemap]
-            try:
-                if len(pmap) == 0:
-                    return True
-            except TypeError:
-                try:
-                    if len(list(pmap.keys())) == 0:
-                        return True
-                except Exception:
-                    pass
-
-        return False
 
 
 

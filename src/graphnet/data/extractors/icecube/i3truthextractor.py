@@ -703,6 +703,8 @@ class I3TruthExtractorPONE(I3Extractor):
             "stopping_track":  padding_value,
             "through_going":   padding_value,
             "missed_track":    padding_value,
+            # Track vs cascade: 1 for NuMu/NuMuBar (abs(pid)==14), 0 otherwise
+            "is_track":        padding_value,
         }
 
         if len(frame) == 0:
@@ -751,7 +753,9 @@ class I3TruthExtractorPONE(I3Extractor):
             output["totalColumnDepth"] = ep.totalColumnDepth
             output["impactParameter"] = ep.impactParameter
         except AttributeError:
-            pass  
+            pass
+
+        output["is_track"] = int(abs(output["pid"]) == 14 and output["interaction_type"] == 1)
 
         # Containment flags — only for NuMu/NuMuBar CC events (muon tracks)
         if abs(int(ep.initialType)) == 14:

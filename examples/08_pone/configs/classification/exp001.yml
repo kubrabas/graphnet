@@ -1,0 +1,35 @@
+experiment_name: exp001
+mc:       340StringMC
+geometry: full_geometry
+flavors:  [Muon, Electron, Tau, NC]
+
+output:
+  save_dir: /project/def-nahee/kbas/Graphnet-Applications/Results/training/classification/340StringMC/full_geometry/exp001
+  test_csv_name: test_predictions.csv
+
+data:
+  pulsemaps:   features
+  truth_table: truth
+  features:    [pmt_x, pmt_y, pmt_z, dom_time, charge]
+  truth_all:   [is_track]
+
+training:
+  seed: 20260202
+  max_epochs: 30
+  early_stopping_patience: 5
+  batch_size: 512
+  accumulate_grad_batches: 4
+  base_lr: 1.0e-5
+  peak_lr: 2.0e-3
+  warmup_fraction: 0.5
+  num_workers: 8
+  multiprocessing_context: spawn
+  pin_memory: true
+  val_metrics_max_batches: null
+
+model:
+  nb_neighbours: 8
+  global_pooling_schemes: [min, max, mean, sum]
+  add_global_variables_after_pooling: true
+  add_norm_layer: false
+  skip_readout: false
