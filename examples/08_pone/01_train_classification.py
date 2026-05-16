@@ -256,6 +256,7 @@ if __name__ == "__main__":
 
     b0     = next(iter(train_loader))
     labels = extract_field(b0, "is_track").detach().cpu().view(-1)
-    print(f"[Sanity] is_track: min={labels.min().item()} max={labels.max().item()} mean={labels.mean().item():.3f}")
+    labels_float = labels.float()
+    print(f"[Sanity] is_track: min={labels.min().item()} max={labels.max().item()} mean={labels_float.mean().item():.3f}")
 
     run_classification(cfg, data_representation, train_loader, val_loader)

@@ -32,7 +32,6 @@ from graphnet.training.loss_functions import BinaryCrossEntropyLoss
 from utils import (
     extract_field,
     install_logging_filters,
-    maybe_extract_event_id,
     move_batch_to_device,
 )
 
@@ -43,6 +42,7 @@ from utils import (
 PATHS_PY     = "/project/def-nahee/kbas/Graphnet-Applications/Metadata/paths.py"
 RESULTS_BASE = "/project/def-nahee/kbas/Graphnet-Applications/Results/classification"
 ALL_FLAVORS  = ["Muon", "Electron", "Tau", "NC"]
+ID_FIELDS    = ["RunID", "SubrunID", "EventID", "SubEventID"]
 
 PARQUET_TABLE = {
     "340StringMC":  "STRING340MC_PARQUET",
@@ -91,7 +91,7 @@ def resolve_paths(cfg: dict):
 
 def build_test_loader(cfg: dict, per_flavor: dict, percentiles_csv: str):
     features    = cfg["data"]["features"]
-    truth_all   = cfg["data"]["truth_all"]
+    truth_all   = list(cfg["data"]["truth_all"]) + [f for f in ID_FIELDS if f not in cfg["data"]["truth_all"]]
     pulsemaps   = cfg["data"]["pulsemaps"]
     truth_table = cfg["data"]["truth_table"]
     tcfg        = cfg["training"]
@@ -197,17 +197,25 @@ def run_test(cfg: dict, model: StandardModel, test_loader, out_csv: str) -> None
             batch       = move_batch_to_device(batch, device)
             track_score = model(batch)[0].detach().float().squeeze(-1).cpu()
             true_label  = extract_field(batch, "is_track").detach().float().view(-1).cpu()
-            event_id    = maybe_extract_event_id(batch)
-            if event_id is not None:
-                event_id = event_id.detach().cpu().view(-1)
+
+            id_vals = {}
+            for f in ID_FIELDS:
+                try:
+                    id_vals[f] = extract_field(batch, f).detach().cpu().view(-1)
+                except Exception:
+                    id_vals[f] = None
 
             for i in range(len(true_label)):
-                rows.append({
+                row = {
+                    "RunID":         int(id_vals["RunID"][i].item())      if id_vals["RunID"]      is not None else None,
+                    "SubrunID":      int(id_vals["SubrunID"][i].item())   if id_vals["SubrunID"]   is not None else None,
+                    "EventID":       int(id_vals["EventID"][i].item())    if id_vals["EventID"]    is not None else None,
+                    "SubEventID":    int(id_vals["SubEventID"][i].item()) if id_vals["SubEventID"] is not None else None,
                     "true_is_track": int(true_label[i].item()),
                     "track_score":   float(track_score[i].item()),
                     "pred_is_track": int(track_score[i].item() >= 0.5),
-                    "event_id":      int(event_id[i].item()) if event_id is not None and i < len(event_id) else None,
-                })
+                }
+                rows.append(row)
 
     df = pd.DataFrame(rows)
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)

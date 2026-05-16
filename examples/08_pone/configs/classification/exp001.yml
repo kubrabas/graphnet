@@ -1,10 +1,10 @@
 experiment_name: exp001
 mc:       340StringMC
-geometry: full_geometry
+geometry: 102_string
 flavors:  [Muon, Electron, Tau, NC]
 
 output:
-  save_dir: /project/def-nahee/kbas/Graphnet-Applications/Results/training/classification/340StringMC/full_geometry/exp001
+  save_dir: /project/def-nahee/kbas/Graphnet-Applications/Results/training/classification/340StringMC/102_string/exp001
   test_csv_name: test_predictions.csv
 
 data:

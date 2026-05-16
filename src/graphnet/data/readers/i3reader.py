@@ -1,6 +1,5 @@
 """Module containing different I3Reader."""
 
-import os
 from typing import List, Union, OrderedDict, Optional, Any, Dict
 
 from graphnet.utilities.imports import has_icecube_package
@@ -230,30 +229,22 @@ class PONE_Reader(GraphNeTFileReader):
             return []
 
         data: List[OrderedDict] = []
-        noise_only_events: List[str] = []
-        absent_pulsemap_events: List[str] = []
-        corrupt_frames = 0  # frames that could not be read (not corrupt files)
 
         while i3_file_io.more():
             try:
                 frame = i3_file_io.pop_daq()
-            except Exception:
-                corrupt_frames += 1
-                continue
+            except Exception as e:
+                if "no frame to pop" in str(e):
+                    break
+                raise RuntimeError(
+                    f"Could not read next DAQ frame from {file_path.i3_file}"
+                ) from e
 
             # Apply I3 filters (e.g. NullSplitI3Filter)
             if self._i3filters and any(not f(frame) for f in self._i3filters):
                 continue
 
-            def _event_id(f: "icetray.I3Frame") -> str:
-                if f.Has("I3EventHeader"):
-                    hdr = f["I3EventHeader"]
-                    return (f"RunID={hdr.run_id} SubRunID={hdr.sub_run_id} "
-                            f"EventID={hdr.event_id} SubEventID={hdr.sub_event_id}")
-                return "unknown"
-
             if self._pulsemap not in frame:
-                absent_pulsemap_events.append(_event_id(frame))
                 continue
 
             if self._skip_empty_pulses:
@@ -267,31 +258,11 @@ class PONE_Reader(GraphNeTFileReader):
                     except Exception:
                         pass
                 if pulsemap_empty:
-                    noise_only_events.append(_event_id(frame))
                     continue
 
             results = [extractor(frame) for extractor in self._extractors]
             data_dict = OrderedDict(zip(self.extractor_names, results))
             data.append(data_dict)
-
-        fname = os.path.basename(file_path.i3_file)
-
-        if absent_pulsemap_events:
-            print(f"absent_pulsemap events ({len(absent_pulsemap_events)}):")
-            for eid in absent_pulsemap_events:
-                print(f"  {eid}")
-
-        if noise_only_events:
-            print(f"noise_only events ({len(noise_only_events)}):")
-            for eid in noise_only_events:
-                print(f"  {eid}")
-
-        print(
-            f"[{fname}] kept={len(data)}"
-            f"  noise_only={len(noise_only_events)}"
-            f"  absent_pulsemap={len(absent_pulsemap_events)}"
-            f"  corrupt_frames={corrupt_frames}"
-        )
 
         return data
 
