@@ -9,7 +9,7 @@ from typing import List, Optional, Tuple, Union
 def is_gcd_file(filename: str) -> bool:
     """Check whether `filename` is a GCD file."""
     if (
-        re.search("(gcd|geo)", filename.lower())
+        re.search("gcd", filename.lower())
         or "GeoCalibDetector" in filename
     ):
         return True

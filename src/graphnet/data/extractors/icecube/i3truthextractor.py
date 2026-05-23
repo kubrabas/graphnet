@@ -697,14 +697,15 @@ class I3TruthExtractorPONE(I3Extractor):
             "initialType":      padding_value,
             "totalColumnDepth": padding_value,
             "impactParameter":  padding_value,
+            "category2": padding_value,
             # Muon containment flags (NuMu/NuMuBar CC only — see class docstring)
             "fully_contained": padding_value,
             "starting_track":  padding_value,
             "stopping_track":  padding_value,
             "through_going":   padding_value,
             "missed_track":    padding_value,
-            # Track vs cascade: 1 for NuMu/NuMuBar (abs(pid)==14), 0 otherwise
-            "is_track":        padding_value,
+            # Track vs cascade: 1 for NuMu/NuMuBar CC, 0 otherwise
+            "category1":       padding_value,
         }
 
         if len(frame) == 0:
@@ -749,13 +750,20 @@ class I3TruthExtractorPONE(I3Extractor):
                 "interaction_type": self._get_interaction_type(ep),
             }
         )
+        output["category2"] = self._get_category2(
+            pid=output["pid"],
+            interaction_type=output["interaction_type"],
+            padding_value=padding_value,
+        )
         try:
             output["totalColumnDepth"] = ep.totalColumnDepth
             output["impactParameter"] = ep.impactParameter
         except AttributeError:
             pass
 
-        output["is_track"] = int(abs(output["pid"]) == 14 and output["interaction_type"] == 1)
+        output["category1"] = int(
+            abs(output["pid"]) == 14 and output["interaction_type"] == 1
+        )
 
         # Containment flags — only for NuMu/NuMuBar CC events (muon tracks)
         if abs(int(ep.initialType)) == 14:
@@ -802,6 +810,18 @@ class I3TruthExtractorPONE(I3Extractor):
             dataclasses.I3Particle.NuTauBar,
         ]
         return 2 if ep.finalType1 in neutrinos else 1
+
+    def _get_category2(
+        self, pid: int, interaction_type: int, padding_value: Any = -1
+    ) -> int:
+        """Return numeric PONE class: tau_CC=0, cascade=1, muon_CC=2."""
+        if interaction_type == 2 or abs(pid) == 12:
+            return 1
+        if abs(pid) == 14 and interaction_type == 1:
+            return 2
+        if abs(pid) == 16 and interaction_type == 1:
+            return 0
+        return padding_value
 
     def _inside_detector(self, point: np.ndarray) -> bool:
         """Return True if point is inside the detector convex hull."""

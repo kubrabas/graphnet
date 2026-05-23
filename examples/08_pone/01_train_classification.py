@@ -2,6 +2,7 @@ import argparse
 import importlib.util
 import math
 import os
+import shutil
 
 import pytorch_lightning as pl
 import torch
@@ -76,7 +77,10 @@ def resolve_paths(cfg: dict):
         per_flavor[flavor] = entry
         print(f"[Paths] {flavor}: {entry['train']}")
 
-    percentiles_csv = parquet_mixed.get(geometry, {}).get("percentiles_csv")
+    percentiles_csv = cfg.get("data", {}).get(
+        "percentiles_csv",
+        parquet_mixed.get(geometry, {}).get("percentiles_csv"),
+    )
     if not percentiles_csv:
         raise ValueError(f"{PARQUET_MIXED_TABLE[mc]}['{geometry}']['percentiles_csv'] is None — run compute_mixed_percentiles.py first.")
     print(f"[Paths] percentiles_csv: {percentiles_csv}")
@@ -181,6 +185,24 @@ def build_model(cfg: dict, data_representation, steps_per_epoch_optimizer: int) 
     )
 
 
+def load_checkpoint_if_available(model: StandardModel, cfg: dict) -> None:
+    checkpoint_path = cfg["training"].get("pretrained_weights")
+    if not checkpoint_path:
+        print("[Classification] no pretrained_weights configured, starting from scratch")
+        return
+
+    if not os.path.exists(checkpoint_path):
+        print(f"[Classification] checkpoint not found, starting from scratch: {checkpoint_path}")
+        return
+
+    state = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+
+    model.load_state_dict(state, strict=True)
+    print(f"[Classification] loaded checkpoint: {checkpoint_path}")
+
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
@@ -188,7 +210,7 @@ def build_model(cfg: dict, data_representation, steps_per_epoch_optimizer: int) 
 def run_classification(cfg: dict, data_representation, train_loader, val_loader) -> None:
     install_logging_filters()
 
-    out_dir = os.path.join(cfg["output"]["save_dir"], "classification")
+    out_dir = cfg["output"]["save_dir"]
     os.makedirs(out_dir, exist_ok=True)
 
     tcfg = cfg["training"]
@@ -196,6 +218,7 @@ def run_classification(cfg: dict, data_representation, train_loader, val_loader)
 
     steps_per_epoch_optimizer = math.ceil(len(train_loader) / tcfg["accumulate_grad_batches"])
     model = build_model(cfg, data_representation, steps_per_epoch_optimizer)
+    load_checkpoint_if_available(model, cfg)
 
     early_stop = GraphnetEarlyStopping(
         save_dir=out_dir,
@@ -243,6 +266,7 @@ if __name__ == "__main__":
         cfg = yaml.safe_load(f)
 
     os.makedirs(cfg["output"]["save_dir"], exist_ok=True)
+    shutil.copy2(args.config, os.path.join(cfg["output"]["save_dir"], "config.yml"))
 
     print("\n========== CONFIG ==========")
     print(yaml.dump(cfg, default_flow_style=False))
