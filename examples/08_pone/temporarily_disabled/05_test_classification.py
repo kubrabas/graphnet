@@ -1,11 +1,14 @@
 """
 Evaluate a trained classification model on the test set.
 
-Loads best_model.pth from the training output directory, runs inference
-on the test split, and writes a CSV to the global results directory:
-  Results/classification/<mc>/<geometry>/<experiment_name>_test_predictions.csv
+Loads best_model.pth from the experiment output directory, runs inference
+on the test split, and writes test_predictions.csv next to the training
+artifacts.
 
 Metrics printed: accuracy, track/cascade counts.
+
+The prediction CSV also includes event metadata useful for later studies:
+event_no, true_energy, true_azimuth, true_zenith, and particle IDs.
 
 Usage:
     python3 05_test_classification.py -c configs/classification/exp001.yml
@@ -39,10 +42,17 @@ from utils import (
 # Constants
 # ---------------------------------------------------------------------------
 
-PATHS_PY     = "/project/def-nahee/kbas/Graphnet-Applications/Metadata/paths.py"
-RESULTS_BASE = "/project/def-nahee/kbas/Graphnet-Applications/Results/classification"
-ALL_FLAVORS  = ["Muon", "Electron", "Tau", "NC"]
-ID_FIELDS    = ["RunID", "SubrunID", "EventID", "SubEventID"]
+PATHS_PY    = "/project/def-nahee/kbas/Graphnet-Applications/Metadata/paths.py"
+ALL_FLAVORS = ["Muon", "Electron", "Tau", "NC"]
+ID_FIELDS   = ["RunID", "SubrunID", "EventID", "SubEventID"]
+EXTRA_TRUTH_FIELDS = {
+    "true_energy": "totalEnergy",
+    "true_azimuth": "azimuth",
+    "true_zenith": "zenith",
+    "true_pid": "pid",
+    "true_initial_type": "initialType",
+    "true_interaction_type": "interaction_type",
+}
 
 PARQUET_TABLE = {
     "340StringMC":  "STRING340MC_PARQUET",
@@ -78,7 +88,10 @@ def resolve_paths(cfg: dict):
             raise ValueError(f"{PARQUET_TABLE[mc]}['{geometry}']['{flavor}']['test'] is None.")
         per_flavor[flavor] = entry
 
-    percentiles_csv = parquet_mixed.get(geometry, {}).get("percentiles_csv")
+    percentiles_csv = cfg.get("data", {}).get(
+        "percentiles_csv",
+        parquet_mixed.get(geometry, {}).get("percentiles_csv"),
+    )
     if not percentiles_csv:
         raise ValueError(f"{PARQUET_MIXED_TABLE[mc]}['{geometry}']['percentiles_csv'] is None.")
 
@@ -89,9 +102,21 @@ def resolve_paths(cfg: dict):
 # Data (test only)
 # ---------------------------------------------------------------------------
 
+def _unique(items):
+    unique_items = []
+    for item in items:
+        if item not in unique_items:
+            unique_items.append(item)
+    return unique_items
+
+
 def build_test_loader(cfg: dict, per_flavor: dict, percentiles_csv: str):
     features    = cfg["data"]["features"]
-    truth_all   = list(cfg["data"]["truth_all"]) + [f for f in ID_FIELDS if f not in cfg["data"]["truth_all"]]
+    truth_all   = _unique(
+        list(cfg["data"]["truth_all"])
+        + ID_FIELDS
+        + list(EXTRA_TRUTH_FIELDS.values())
+    )
     pulsemaps   = cfg["data"]["pulsemaps"]
     truth_table = cfg["data"]["truth_table"]
     tcfg        = cfg["training"]
@@ -164,7 +189,13 @@ def build_model(cfg: dict, data_representation) -> StandardModel:
 
 def load_model(cfg: dict, data_representation) -> StandardModel:
     model    = build_model(cfg, data_representation)
-    best_pth = os.path.join(cfg["output"]["save_dir"], "classification", "best_model.pth")
+    best_pth = os.path.join(cfg["output"]["save_dir"], "best_model.pth")
+    legacy_best_pth = os.path.join(
+        cfg["output"]["save_dir"], "classification", "best_model.pth"
+    )
+
+    if not os.path.exists(best_pth) and os.path.exists(legacy_best_pth):
+        best_pth = legacy_best_pth
 
     if not os.path.exists(best_pth):
         raise FileNotFoundError(f"best_model.pth not found: {best_pth}")
@@ -180,6 +211,21 @@ def load_model(cfg: dict, data_representation) -> StandardModel:
 # ---------------------------------------------------------------------------
 # Inference
 # ---------------------------------------------------------------------------
+
+def _extract_optional_field(batch, field: str):
+    try:
+        return extract_field(batch, field).detach().cpu().view(-1)
+    except Exception:
+        return None
+
+
+def _optional_int(values, index: int):
+    return int(values[index].item()) if values is not None else None
+
+
+def _optional_float(values, index: int):
+    return float(values[index].item()) if values is not None else None
+
 
 def run_test(cfg: dict, model: StandardModel, test_loader, out_csv: str) -> None:
     install_logging_filters()
@@ -198,19 +244,27 @@ def run_test(cfg: dict, model: StandardModel, test_loader, out_csv: str) -> None
             track_score = model(batch)[0].detach().float().squeeze(-1).cpu()
             true_label  = extract_field(batch, "is_track").detach().float().view(-1).cpu()
 
-            id_vals = {}
-            for f in ID_FIELDS:
-                try:
-                    id_vals[f] = extract_field(batch, f).detach().cpu().view(-1)
-                except Exception:
-                    id_vals[f] = None
+            id_vals = {f: _extract_optional_field(batch, f) for f in ID_FIELDS}
+            extra_vals = {
+                out_name: _extract_optional_field(batch, source_name)
+                for out_name, source_name in EXTRA_TRUTH_FIELDS.items()
+            }
+            event_no = _extract_optional_field(batch, "event_no")
 
             for i in range(len(true_label)):
+                true_pid = _optional_int(extra_vals["true_pid"], i)
                 row = {
-                    "RunID":         int(id_vals["RunID"][i].item())      if id_vals["RunID"]      is not None else None,
-                    "SubrunID":      int(id_vals["SubrunID"][i].item())   if id_vals["SubrunID"]   is not None else None,
-                    "EventID":       int(id_vals["EventID"][i].item())    if id_vals["EventID"]    is not None else None,
-                    "SubEventID":    int(id_vals["SubEventID"][i].item()) if id_vals["SubEventID"] is not None else None,
+                    "event_no":      _optional_int(event_no, i),
+                    "RunID":         _optional_int(id_vals["RunID"], i),
+                    "SubrunID":      _optional_int(id_vals["SubrunID"], i),
+                    "EventID":       _optional_int(id_vals["EventID"], i),
+                    "SubEventID":    _optional_int(id_vals["SubEventID"], i),
+                    "true_energy":   _optional_float(extra_vals["true_energy"], i),
+                    "true_azimuth":  _optional_float(extra_vals["true_azimuth"], i),
+                    "true_zenith":   _optional_float(extra_vals["true_zenith"], i),
+                    "true_pid":      true_pid,
+                    "true_initial_type": _optional_int(extra_vals["true_initial_type"], i),
+                    "true_interaction_type": _optional_int(extra_vals["true_interaction_type"], i),
                     "true_is_track": int(true_label[i].item()),
                     "track_score":   float(track_score[i].item()),
                     "pred_is_track": int(track_score[i].item() >= 0.5),
@@ -249,10 +303,8 @@ if __name__ == "__main__":
     model = load_model(cfg, data_representation)
 
     out_csv = os.path.join(
-        RESULTS_BASE,
-        cfg["mc"],
-        cfg["geometry"],
-        f"{cfg['experiment_name']}_test_predictions.csv",
+        cfg["output"]["save_dir"],
+        cfg["output"].get("test_csv_name", "test_predictions.csv"),
     )
 
     run_test(cfg, model, test_loader, out_csv)
