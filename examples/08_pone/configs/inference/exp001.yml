@@ -1,0 +1,93 @@
+experiment_name: exp001
+
+task:
+  type: inference
+  mode: routed
+
+mc: 340StringMC
+geometry: 102_string_emax1e6
+flavors: [Muon, Electron, Tau, NC]
+
+routing:
+  # Classification labels are used as reconstruction route classes.
+  category: first_category
+  classes: [0, 1]
+
+classification:
+  config: /project/def-nahee/kbas/graphnet/examples/08_pone/configs/classification/exp001.yml
+  best_model: /project/def-nahee/kbas/Graphnet-Applications/Results/340StringMC/102_string_emax1e6/classification/category1/exp001/train_and_val/best_model.pth
+  # null uses argmax. For binary routing, set e.g. 0.5 to force a probability cut.
+  threshold: 0.5
+  positive_label: 1
+
+reconstruction:
+  config: /project/def-nahee/kbas/graphnet/examples/08_pone/configs/reconstruction/exp001.yml
+  targets: [energy, zenith, azimuth]
+  models:
+    "0":
+      energy: /project/def-nahee/kbas/Graphnet-Applications/Results/340StringMC/102_string_emax1e6/reconstruction/first_category/class0/exp001/train_and_val/energy/best_model.pth
+      zenith: /project/def-nahee/kbas/Graphnet-Applications/Results/340StringMC/102_string_emax1e6/reconstruction/first_category/class0/exp001/train_and_val/zenith/best_model.pth
+      azimuth: /project/def-nahee/kbas/Graphnet-Applications/Results/340StringMC/102_string_emax1e6/reconstruction/first_category/class0/exp001/train_and_val/azimuth/best_model.pth
+    "1":
+      energy: /project/def-nahee/kbas/Graphnet-Applications/Results/340StringMC/102_string_emax1e6/reconstruction/first_category/class1/exp001/train_and_val/energy/best_model.pth
+      zenith: /project/def-nahee/kbas/Graphnet-Applications/Results/340StringMC/102_string_emax1e6/reconstruction/first_category/class1/exp001/train_and_val/zenith/best_model.pth
+      azimuth: /project/def-nahee/kbas/Graphnet-Applications/Results/340StringMC/102_string_emax1e6/reconstruction/first_category/class1/exp001/train_and_val/azimuth/best_model.pth
+
+output:
+  root_dir: /project/def-nahee/kbas/Graphnet-Applications/Results
+  dirs:
+    inference: inference
+
+run:
+  existing_output: error
+
+data:
+  split: test
+  pulsemaps: features
+  truth_table: truth
+  features: [pmt_x, pmt_y, pmt_z, dom_time, charge]
+  truth_all:
+    - event_no
+    - RunID
+    - SubrunID
+    - EventID
+    - SubEventID
+    - position_x
+    - position_y
+    - position_z
+    - pid
+    - interaction_type
+    - totalEnergy
+    - zenith
+    - azimuth
+    - finalStateX
+    - finalStateY
+    - finalType1
+    - finalType2
+    - initialType
+    - totalColumnDepth
+    - impactParameter
+    - fully_contained
+    - starting_track
+    - stopping_track
+    - through_going
+    - missed_track
+    - category1
+    - category2
+  # If null, classification uses ROBUST_SCALER[mc][geometry]["mixed"] and
+  # reconstruction uses ROBUST_SCALER[mc][geometry]["<routing>_mixed_<class>"].
+  percentiles_csv: null
+
+inference:
+  batch_size: 512
+  num_workers: 8
+  multiprocessing_context: spawn
+  pin_memory: true
+
+slurm:
+  account: def-nahee
+  time: "12:00:00"
+  mem: 48G
+  cpus_per_task: 8
+  gpus_per_node: nvidia_h100_80gb_hbm3_3g.40gb:1
+  exclude: fc10713

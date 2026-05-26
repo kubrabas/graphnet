@@ -291,10 +291,17 @@ class EpochCSVLogger(Callback):
 
 
 class ValidationResidualAndLRMetrics(Callback):
-    def __init__(self, target: str, val_loader, max_batches: Optional[int] = None):
+    def __init__(
+        self,
+        target: str,
+        val_loader,
+        max_batches: Optional[int] = None,
+        target_label: Optional[str] = None,
+    ):
         self.target = target
         self.val_loader = val_loader
         self.max_batches = max_batches
+        self.target_label = target_label or target
 
     @staticmethod
     def _quantiles_and_W(x: torch.Tensor):
@@ -344,7 +351,7 @@ class ValidationResidualAndLRMetrics(Callback):
 
                 elif self.target == "energy":
                     pred_log10 = pred0.squeeze(-1)
-                    true_E = extract_field(batch, "energy").detach().float().view(-1).to(device)
+                    true_E = extract_field(batch, self.target_label).detach().float().view(-1).to(device)
                     true_log10 = torch.log10(torch.clamp(true_E, min=eps_like(true_E)))
                     residual_log10_all.append((pred_log10 - true_log10).cpu())
 

@@ -1,0 +1,181 @@
+experiment_name: exp002
+
+# Generic task block.
+# type options:
+#   classification -> train/evaluate a classification model
+#   reconstruction -> train/evaluate energy/zenith/azimuth models
+#   inference      -> run the final full pipeline
+#
+# classification mode options:
+#   binary     -> two-class problem, usually labels [0, 1]
+#   multiclass -> N-class problem with integer labels like [0, 1, 2]
+task:
+  type: classification
+  mode: multiclass
+
+  # Truth-table column used as the target.
+  target: category2
+
+  # Numeric class ids. category2 maps:
+  #   0 -> tau_CC
+  #   1 -> all NC + electron CC
+  #   2 -> muon_CC
+  labels: [0, 1, 2]
+
+  # Probability columns will be created for every class:
+  #   p_class_0, p_class_1, p_class_2
+  prediction_prefix: p_class
+
+  # Class names used in plots/tables and, by default, as inference routing
+  # labels. They do not change the training loss.
+  class_names:
+    0: tau_CC
+    1: electron_CC_or_NC
+    2: muon_CC
+
+# Dataset family and detector geometry. pipeline_utils will resolve sample
+# paths through:
+#   /project/def-nahee/kbas/Graphnet-Applications/Metadata/paths.py
+mc: 340StringMC
+geometry: 102_string_emax1e6
+
+# Flavor/sample groups to include. Available options depend on paths.py.
+flavors: [Muon, Electron, Tau, NC]
+
+output:
+  # Main results root. Keep this absolute.
+  #
+  # pipeline_utils derives the experiment directory from:
+  #   root_dir / mc / geometry / task.type / task.target / experiment_name
+  #
+  # Example:
+  #   /project/def-nahee/kbas/Graphnet-Applications/Results
+  #     /340StringMC/102_string_emax1e6/classification/category2/exp002
+  root_dir: /project/def-nahee/kbas/Graphnet-Applications/Results
+
+  # Training and validation artifacts go under:
+  #   derived_experiment_dir / train_and_val
+  #
+  # Examples:
+  #   best_model.pth
+  #   training_history_by_epoch.csv
+  #   resources_and_time.csv
+  #   config.yml
+  #   validation_roc_curve.png
+  #   validation_score_distribution_by_true_class.png
+  #   validation_metrics_summary.csv
+  #   validation_confusion_matrix_youden_j.png
+  #   validation_confusion_matrix_closest_top_left.png
+  dirs:
+    train: train_and_val
+
+# Classification validation diagnostics.
+#
+# After training, the best model should be evaluated on the validation split.
+#
+# The validation ROC plot should be written under dirs.train:
+#   validation_roc_curve.png
+#     - uses one-vs-rest curves for every class
+#       binary: 2 curves; multiclass: N curves
+#     - includes per-class AUC and macro/weighted AUC in the plot title/label
+#     - does not draw threshold markers on the ROC curve
+#     - writes these per-class threshold values in a right-side text/table panel:
+#       Youden J: max(TPR - FPR)
+#       Closest top-left: min distance to (FPR=0, TPR=1)
+#
+# The score distribution plot should be written under dirs.train:
+#   validation_score_distribution_by_true_class.png
+#     - one histogram per true class using that class probability score
+#       true 0 -> p_class_0, true 1 -> p_class_1, ...
+#     - works the same for binary and multiclass
+#     - no table and no p = 0.5 reference
+#     - show Youden J and closest top-left as short x-axis ticks, not full-height
+#       lines; each class's ticks use the same color as that class's histogram
+#
+# Threshold-dependent validation metrics should be computed for both
+# thresholds above and written under dirs.train:
+#   validation_metrics_summary.csv
+#     - accuracy, precision, recall, specificity, F1, TP/FP/TN/FN
+#     - one row per threshold method
+#   validation_confusion_matrix_youden_j.png
+#   validation_confusion_matrix_closest_top_left.png
+#
+# The final probability threshold p belongs in the inference config because it
+# controls event routing there.
+
+data:
+  # Parquet pulse map and event-level truth table names.
+  pulsemaps: features
+  truth_table: truth
+
+  # Input node features passed to PONE/DynEdge.
+  features: [pmt_x, pmt_y, pmt_z, dom_time, charge]
+
+  # Event-level fields loaded from truth_table.
+  # Must include task.target. Extra fields are not used by the classification
+  # loss, but are useful for validation diagnostics and later inference/reco
+  # studies, e.g. checking misroutes versus totalEnergy or direction.
+  truth_all:
+    - category2
+    - totalEnergy
+    - zenith
+    - azimuth
+    - pid
+    - interaction_type
+
+  # Robust-scaler percentiles used by the PONE detector transform.
+  # If null, pipeline_utils resolves the mixed scaler from paths.py:
+  #   ROBUST_SCALER[mc][geometry]["mixed"]
+  percentiles_csv: null
+
+# Optional per-event loss weighting for imbalance.
+# GraphNeT can read a weight column from the dataset and pass it into the loss.
+# To enable later:
+#   enabled: true
+#   loss_weight_table: truth
+#   loss_weight_column: class_weight
+#   loss_weight_default_value: 1.0
+weights:
+  enabled: false
+  loss_weight_table: null
+  loss_weight_column: null
+  loss_weight_default_value: 1.0
+
+training:
+  # Reproducibility.
+  seed: 20260202
+
+  # Trainer limits and early stopping.
+  max_epochs: 30
+  early_stopping_patience: 5
+
+  # Effective batch size is batch_size * accumulate_grad_batches.
+  batch_size: 512
+  accumulate_grad_batches: 4
+
+  # PiecewiseLinearLR schedule: base -> peak during warmup, then back to base.
+  base_lr: 1.0e-6
+  peak_lr: 1.0e-4
+  warmup_fraction: 0.5
+
+  # DataLoader settings. ParquetDataset usually works best with spawn workers.
+  num_workers: 8
+  multiprocessing_context: spawn
+  pin_memory: true
+
+  # Optional cap for expensive validation diagnostics. null means all val batches.
+  val_metrics_max_batches: null
+
+  # Optional checkpoint/state_dict path. null means train from scratch.
+  pretrained_weights: null
+
+model:
+  # Model registry name. Initial implementation will support dynedge.
+  name: dynedge
+
+  # DynEdge graph/model settings.
+  nb_neighbours: 8
+  global_pooling_schemes: [min, max, mean, sum]
+  add_global_variables_after_pooling: true
+  add_norm_layer: false
+  skip_readout: false
