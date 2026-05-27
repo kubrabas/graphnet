@@ -129,7 +129,11 @@ def resolve_percentiles(cfg: dict, route_class: str | None = None) -> str:
 
 def build_loader(cfg: dict, paths: Dict[str, str], percentiles_csv: str, model_cfg: dict):
     features = cfg["data"]["features"]
-    truth_all = unique([*EVENT_ID_FIELDS, *cfg["data"]["truth_all"]])
+    truth_all = [
+        field
+        for field in unique([*EVENT_ID_FIELDS, *cfg["data"]["truth_all"]])
+        if field != "event_no"
+    ]
     loader_cfg = cfg["inference"]
 
     data_representation = KNNGraph(
