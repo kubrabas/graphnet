@@ -6,8 +6,41 @@ The active workflow is split into two stages:
 1. Classification models for event routing.
 2. Routed reconstruction models trained separately for every routing class and target.
 
+Classification, reconstruction, and routed inference use the current category
+and mixed-scaler layout. Active inference configs currently cover only the
+`102_string_emax1e6` and `160_string_emax1e6` geometries. Full-geometry inference
+must wait until its classification and reconstruction models have been trained.
+
 The scripts are written to run inside the GraphNeT training container through the
 SLURM wrappers in `/home/kbas/SlurmScripts/GraphNet`.
+
+## Submit All 102-String Training Jobs
+
+Connect to Fir, leave `.venv_try` if it is active, and change to the project root:
+
+```bash
+ssh fir
+deactivate 2>/dev/null || true
+cd /project/def-nahee/kbas
+```
+
+Submit all three 102-string classification jobs:
+
+```bash
+for config in graphnet/examples/08_pone/configs/classification/102_string_emax1e6__*.yml; do
+  python3 /home/kbas/SlurmScripts/GraphNet/submit_classification_pipeline.py \
+    -c "$config"
+done
+```
+
+Submit all 21 routed 102-string reconstruction jobs:
+
+```bash
+for config in graphnet/examples/08_pone/configs/reconstruction/102_string_emax1e6__*.yml; do
+  python3 /home/kbas/SlurmScripts/GraphNet/submit_reconstruction_pipeline.py \
+    -c "$config"
+done
+```
 
 ## Active Scripts
 
@@ -15,10 +48,12 @@ SLURM wrappers in `/home/kbas/SlurmScripts/GraphNet`.
 | --- | --- |
 | `train_scripts/train_classification.py` | Trains one classification model from a config. Called by the SLURM wrapper. |
 | `train_scripts/train_reconstruction.py` | Trains one reconstruction model for one routing class and one target. Called by the SLURM wrapper. |
+| `inference_scripts/run_inference.py` | Runs classification, routed reconstruction, and report generation for one inference config. |
 | `pipeline_utils.py` | Classification path resolution, loaders, validation diagnostics, plotting helpers. |
 | `utils.py` | Shared GraphNeT callbacks, resource logging, reconstruction task helpers, residual metrics. |
 | `/home/kbas/SlurmScripts/GraphNet/submit_classification_pipeline.py` | Submit one classification training job. |
 | `/home/kbas/SlurmScripts/GraphNet/submit_reconstruction_pipeline.py` | Expand one reconstruction config into class x target SLURM jobs. |
+| `/home/kbas/SlurmScripts/GraphNet/submit_inference_pipeline.py` | Validate dependencies and submit one routed inference job. |
 | `/home/kbas/SlurmScripts/GraphNet/train_classification.sh` | Container/environment wrapper for classification. |
 | `/home/kbas/SlurmScripts/GraphNet/train_reconstruction.sh` | Container/environment wrapper for reconstruction. |
 
@@ -34,27 +69,26 @@ Classification configs live in:
 configs/classification/
 ```
 
-Current examples:
+There is one config per geometry and classification target. For example:
 
 | Config | Geometry | Target | Mode |
 | --- | --- | --- | --- |
-| `exp001.yml` | `102_string_emax1e6` | `category1` | binary |
-| `exp002.yml` | `102_string_emax1e6` | `category2` | multiclass |
-| `exp003.yml` | `full_geometry_emax1e6` | `category1` | binary |
-| `exp004.yml` | `full_geometry_emax1e6` | `category2` | multiclass |
+| `102_string_emax1e6__category1_isMuonCC.yml` | `102_string_emax1e6` | `category1_isMuonCC` | binary |
+| `102_string_emax1e6__category2_tauCC_others_muonCC.yml` | `102_string_emax1e6` | `category2_tauCC_others_muonCC` | multiclass |
+| `102_string_emax1e6__category_3_contains_muon.yml` | `102_string_emax1e6` | `category_3_contains_muon` | binary |
 
 Submit one classification job:
 
 ```bash
 python3 /home/kbas/SlurmScripts/GraphNet/submit_classification_pipeline.py \
-  -c /project/def-nahee/kbas/graphnet/examples/08_pone/configs/classification/exp001.yml
+  -c /project/def-nahee/kbas/graphnet/examples/08_pone/configs/classification/102_string_emax1e6__category1_isMuonCC.yml
 ```
 
 Exclude a bad node if needed:
 
 ```bash
 python3 /home/kbas/SlurmScripts/GraphNet/submit_classification_pipeline.py \
-  -c /project/def-nahee/kbas/graphnet/examples/08_pone/configs/classification/exp003.yml \
+  -c /project/def-nahee/kbas/graphnet/examples/08_pone/configs/classification/102_string_emax1e6__category1_isMuonCC.yml \
   --exclude fc10713
 ```
 
@@ -69,7 +103,7 @@ Example:
 
 ```text
 /project/def-nahee/kbas/Graphnet-Applications/Results/
-  340StringMC/full_geometry_emax1e6/classification/category1/exp003/train_and_val/
+  340StringMC/102_string_emax1e6/classification/category1_isMuonCC/baseline/train_and_val/
 ```
 
 Classification training writes the config snapshot, best model, training history,
@@ -83,10 +117,10 @@ Reconstruction configs live in:
 configs/reconstruction/
 ```
 
-The current example is:
+For example:
 
 ```text
-configs/reconstruction/exp001.yml
+configs/reconstruction/102_string_emax1e6__category1_isMuonCC.yml
 ```
 
 Reconstruction is routed by a classification category. The config chooses the
@@ -94,7 +128,7 @@ routing category and class selection:
 
 ```yaml
 routing:
-  category: first_category
+  category: category1_isMuonCC
   classes: all
 ```
 
@@ -103,7 +137,7 @@ routing:
 
 ```yaml
 routing:
-  category: first_category
+  category: category1_isMuonCC
   classes: [0]
 ```
 
@@ -127,18 +161,18 @@ Submit reconstruction jobs:
 
 ```bash
 python3 /home/kbas/SlurmScripts/GraphNet/submit_reconstruction_pipeline.py \
-  -c /project/def-nahee/kbas/graphnet/examples/08_pone/configs/reconstruction/exp001.yml
+  -c /project/def-nahee/kbas/graphnet/examples/08_pone/configs/reconstruction/102_string_emax1e6__category1_isMuonCC.yml
 ```
 
 Dry-run first:
 
 ```bash
 python3 /home/kbas/SlurmScripts/GraphNet/submit_reconstruction_pipeline.py \
-  -c /project/def-nahee/kbas/graphnet/examples/08_pone/configs/reconstruction/exp001.yml \
+  -c /project/def-nahee/kbas/graphnet/examples/08_pone/configs/reconstruction/102_string_emax1e6__category1_isMuonCC.yml \
   --dry-run
 ```
 
-For the default `exp001.yml`, `full_geometry_emax1e6 + first_category` resolves
+The `102_string_emax1e6__category1_isMuonCC.yml` config resolves
 classes `0` and `1`; with targets `energy`, `zenith`, and `azimuth`, the submit
 wrapper creates 6 independent SLURM jobs:
 
@@ -166,13 +200,13 @@ Example:
 
 ```text
 /project/def-nahee/kbas/Graphnet-Applications/Results/
-  340StringMC/full_geometry_emax1e6/reconstruction/first_category/class0/exp001/train_and_val/energy/
+  340StringMC/102_string_emax1e6/reconstruction/category1_isMuonCC/class0/baseline/train_and_val/energy/
 ```
 
 Each target folder contains:
 
 ```text
-config.yml
+pipeline_config.yml
 best_model.pth
 training_history_by_epoch.csv
 resources_and_time.csv
@@ -186,6 +220,50 @@ validation_kappa_distribution.png                 # zenith/azimuth
 
 All reconstruction validation CSVs and plots are computed after loading
 `best_model.pth` and using the validation split.
+
+## Inference
+
+Active inference configs live in `configs/inference/`. There are six configs:
+three routing categories for 102 strings and three for 160 strings. The archived
+experiment configs are under `configs/inference_old/`. There is intentionally no
+full-geometry inference config yet.
+
+The submit wrapper checks all test parquet paths, mixed scalers, model
+checkpoints, validation summaries, referenced training configs, and the report
+template before submitting. Submit only the completed 102-string
+`category1_isMuonCC` pipeline with:
+
+```bash
+cd /project/def-nahee/kbas
+python3 /home/kbas/SlurmScripts/GraphNet/submit_inference_pipeline.py \
+  -c graphnet/examples/08_pone/configs/inference/102_string_emax1e6__category1_isMuonCC.yml
+```
+
+Submit every ready 102- and 160-string config with:
+
+```bash
+ssh fir
+deactivate 2>/dev/null || true
+cd /project/def-nahee/kbas
+
+for geometry in 102_string_emax1e6 160_string_emax1e6; do
+  for config in graphnet/examples/08_pone/configs/inference/${geometry}__*.yml; do
+    python3 /home/kbas/SlurmScripts/GraphNet/submit_inference_pipeline.py \
+      -c "$config"
+  done
+done
+```
+
+Use `--dry-run` on one config to run the same preflight and print the `sbatch`
+command without submitting. Each job writes to:
+
+```text
+Graphnet-Applications/Results/340StringMC/<geometry>/inference/<category>/baseline/inference/
+```
+
+The output directory contains classification predictions, routed event counts,
+reconstruction predictions, the joined `inference_predictions.csv`, the config
+snapshot, the SLURM log, and the executed report notebook.
 
 ## Existing Output Policy
 
@@ -232,8 +310,8 @@ default because it produced CUDA unavailable errors in classification jobs.
 ```yaml
 slurm:
   account: def-nahee
-  time: "12:00:00"
-  mem: 48G
+  time: "24:00:00"
+  mem: 64G
   cpus_per_task: 8
   gpus_per_node: nvidia_h100_80gb_hbm3_3g.40gb:1
   exclude: fc10713
@@ -257,7 +335,7 @@ STRING340MC_PARQUET[geometry][flavor][routing.category][class_id][split]
 ```
 
 For each routing class, available flavor paths are mixed with `EnsembleDataset`.
-`does_not_exit` paths are skipped; `None` paths are treated as configuration
+`does_not_exist` paths are skipped; `None` paths are treated as configuration
 errors. The job log prints the number of feature/truth parquet files found for
 each input path.
 

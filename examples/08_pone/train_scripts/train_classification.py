@@ -3,7 +3,7 @@ Train a P-ONE classification model from a config file.
 
 Usage:
     python3 examples/08_pone/train_scripts/train_classification.py \
-        -c examples/08_pone/configs/classification/exp001.yml
+        -c examples/08_pone/configs/classification/102_string_emax1e6__category1_isMuonCC.yml
 
 SLURM:
     This script is meant to be called from the external classification SLURM
@@ -176,6 +176,7 @@ def run_training(cfg: dict, data_representation, train_loader, val_loader, out_d
         accelerator="gpu",
         devices=1,
         callbacks=callbacks,
+        logger=False,
         enable_checkpointing=False,
         enable_progress_bar=False,
         accumulate_grad_batches=train_cfg["accumulate_grad_batches"],

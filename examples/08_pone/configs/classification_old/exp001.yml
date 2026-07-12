@@ -1,4 +1,4 @@
-experiment_name: exp003
+experiment_name: exp001
 
 # Generic task block.
 # type options:
@@ -14,7 +14,7 @@ task:
   mode: binary
 
   # Truth-table column used as the target.
-  target: category1
+  target: category1_isMuonCC
 
   # Numeric class ids. Keep binary labels as [0, 1].
   labels: [0, 1]
@@ -33,7 +33,7 @@ task:
 # paths through:
 #   /project/def-nahee/kbas/Graphnet-Applications/Metadata/paths.py
 mc: 340StringMC
-geometry: full_geometry_emax1e6
+geometry: 102_string_emax1e6
 
 # Flavor/sample groups to include. Available options depend on paths.py.
 flavors: [Muon, Electron, Tau, NC]
@@ -46,7 +46,7 @@ output:
   #
   # Example:
   #   /project/def-nahee/kbas/Graphnet-Applications/Results
-  #     /340StringMC/full_geometry_emax1e6/classification/category1/exp003
+  #     /340StringMC/102_string_emax1e6/classification/category1_isMuonCC/exp001
   root_dir: /project/def-nahee/kbas/Graphnet-Applications/Results
 
   # Training and validation artifacts go under:
@@ -64,11 +64,6 @@ output:
   #   validation_confusion_matrix_closest_top_left.png
   dirs:
     train: train_and_val
-
-run:
-  # Existing target output directory behavior: error | skip | overwrite.
-  # overwrite removes the train_and_val directory before training starts.
-  existing_output: error
 
 # Classification validation diagnostics.
 #
@@ -117,12 +112,12 @@ data:
   # loss, but are useful for validation diagnostics and later inference/reco
   # studies, e.g. checking misroutes versus totalEnergy or direction.
   truth_all:
-    - category1
+    - category1_isMuonCC
     - totalEnergy
     - zenith
     - azimuth
     - pid
-    - interaction_type
+    - is_CC
 
   # Robust-scaler percentiles used by the PONE detector transform.
   # If null, pipeline_utils resolves the mixed scaler from paths.py:
@@ -180,11 +175,3 @@ model:
   add_global_variables_after_pooling: true
   add_norm_layer: false
   skip_readout: false
-
-slurm:
-  account: def-nahee
-  time: "24:00:00"
-  mem: 64G
-  cpus_per_task: 8
-  gpus_per_node: nvidia_h100_80gb_hbm3_3g.40gb:1
-  exclude: fc10713

@@ -1,0 +1,138 @@
+experiment_name: exp003
+
+# Reconstruction with learnable full-geometry string selection.
+# This config is separate from exp003.yml; the original file is unchanged.
+task:
+  type: reconstruction
+  mode: separate
+  targets: [energy, zenith, azimuth]
+
+mc: 340StringMC
+geometry: full_geometry_emax1e6
+
+routing:
+  category: first_category
+  classes: all
+
+output:
+  root_dir: /project/def-nahee/kbas/Graphnet-Applications/Results
+  dirs:
+    train: train_and_val
+
+run:
+  existing_output: error
+
+validation:
+  write_predictions: true
+  write_summary: true
+  write_plots: true
+
+data:
+  pulsemaps: features
+  truth_table: truth
+  features: [pmt_x, pmt_y, pmt_z, dom_time, charge]
+
+  truth_all:
+    - event_no
+    - RunID
+    - EventID
+    - totalEnergy
+    - zenith
+    - azimuth
+    - pid
+    - is_CC
+    - category1_isMuonCC
+    - category2_tauCC_others_muonCC
+    - category_3_contains_muon
+
+  percentiles_csv: null
+
+weights:
+  enabled: false
+  loss_weight_table: truth
+  loss_weight_column: event_weight
+  loss_weight_default_value: 1.0
+
+training:
+  seed: 20260202
+  max_epochs: 30
+  early_stopping_patience: 5
+  batch_size: 512
+  accumulate_grad_batches: 4
+  base_lr: 1.0e-5
+  peak_lr: 2.0e-3
+  warmup_fraction: 0.5
+  num_workers: 8
+  multiprocessing_context: spawn
+  pin_memory: true
+  val_metrics_max_batches: null
+  pretrained_weights: null
+
+model:
+  name: dynedge
+  nb_neighbours: 8
+  global_pooling_schemes: [min, max, mean, sum]
+  add_global_variables_after_pooling: true
+  add_norm_layer: false
+  skip_readout: false
+  transform_support: [10.0, 1.0e+8]
+
+geometry_selection:
+  # PONE feature extractor writes this node-level column.
+  string_feature: string_number
+  max_string_id: 340
+  active_strings: 70
+  budget_lambda: 1.0e-3
+  gate_mode: straight_through_topk
+  gate_on: charge
+  output_tag: geometry_selection
+
+target_settings:
+  energy:
+    loss: log_cosh
+    target_labels: [totalEnergy]
+    prediction_labels: [log10_energy_pred]
+    transform_target: log10
+    transform_inference: pow10
+    metrics: energy_log10
+
+  zenith:
+    loss: von_mises_fisher_2d
+    target_labels: [zenith]
+    prediction_labels: [zenith_pred, zenith_kappa]
+    metrics: angle_deg
+
+  azimuth:
+    loss: von_mises_fisher_2d
+    target_labels: [azimuth]
+    prediction_labels: [azimuth_pred, azimuth_kappa]
+    metrics: angle_deg
+
+target_overrides:
+  enabled: false
+  energy:
+    training: {}
+    model: {}
+    target_settings: {}
+  zenith:
+    training: {}
+    model: {}
+    target_settings: {}
+  azimuth:
+    training: {}
+    model: {}
+    target_settings: {}
+
+slurm:
+  account: def-nahee
+  time: "36:00:00"
+  mem: 64G
+  cpus_per_task: 8
+  gpus_per_node: nvidia_h100_80gb_hbm3_3g.40gb:1
+  exclude: fc10713
+
+slurm_overrides:
+  enabled: false
+  energy: {}
+  zenith: {}
+  azimuth: {}

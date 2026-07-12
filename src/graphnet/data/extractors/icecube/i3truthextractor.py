@@ -546,67 +546,83 @@ class I3TruthExtractor(I3Extractor):
 class I3TruthExtractorPONE(I3Extractor):
     """Truth extractor for PONE/LeptonInjector simulations.
 
-    Extracts per-event kinematics from EventProperties and computes five
-    mutually exclusive muon track containment flags for NuMu/NuMuBar CC events.
+    Extracts per-event kinematics from EventProperties, trigger metadata,
+    category labels, and optional muon track containment flags.
 
     All containment flags describe the muon's path relative to the detector
     convex hull (built from the GCD file passed to ``set_gcd``).
 
     ---
 
-    Coordinate sources
-    ------------------
-    ``ep.x / ep.y / ep.z``  (from ``EventProperties``)
-        The neutrino interaction vertex — equivalently, the point where the
-        muon is born.  Used as the muon's **birth position**.
+    Category labels
+    ---------------
+    ``category1_isMuonCC``
+        1 when the primary neutrino is NuMu/NuMuBar and the interaction is
+        charged-current; 0 otherwise.
 
-    ``mmc.xi / mmc.yi / mmc.zi``  (from ``MMCTrackList``)
-        The point where the muon crosses into the PROPOSAL simulation
-        cylinder.  This cylinder is defined around the *full* detector
-        geometry used in the simulation, which may be larger than the
-        sub-geometry GCD hull used here.  Used only for the
-        ``through_going`` segment sampling (not for containment checks).
+    ``category2_tauCC_others_muonCC``
+        Three-class label: tau CC = 0, cascade/other = 1, muon CC = 2.
 
-    ``mmc.xf / mmc.yf / mmc.zf``  (from ``MMCTrackList``)
-        Either the muon's **actual stopping point** (if it runs out of
-        energy inside the PROPOSAL cylinder) or the point where it
-        **exits** the PROPOSAL cylinder (if it is still energetic).
-        In both cases, checking this point against the detector hull
-        correctly answers "did the muon stop inside the detector?":
-        a stopped muon gives its true final position; a cylinder-exiting
-        muon gives a point that is outside the (smaller) detector hull.
-        Used as the muon's **end position**.
+    ``category_3_contains_muon``
+        1 when ``I3MCTree_postprop`` contains any MuMinus or MuPlus; 0
+        otherwise. This is intentionally independent of
+        ``category1_isMuonCC``.
 
     ---
 
-    Containment flags  (NuMu / NuMuBar CC only)
-    --------------------------------------------
+    Muon track source
+    -----------------
+    When ``category_3_contains_muon`` is 1, the extractor selects the only
+    "fresh" post-propagation muon in ``I3MCTree_postprop``. A fresh muon is a
+    MuMinus/MuPlus whose parent is not a MuMinus/MuPlus. Its stored position is
+    used as the track start, and ``pos + dir * length`` is used as the track
+    end.
+
+    ---
+
+    Containment flags
+    -----------------
     All flags are binary (0 or 1) and mutually exclusive.
-    They are set to the padding value (-1) for non-NuMu events or
-    when ``MMCTrackList`` is absent from the frame.
+    They are set to the padding value (-1) when no post-propagation muon is
+    present.
 
     ``fully_contained``
-        birth inside detector  AND  end inside detector.
+        start inside detector  AND  end inside detector.
         The muon is created and stops entirely within the hull.
 
     ``starting_track``
-        birth inside detector  AND  end outside detector.
+        start inside detector  AND  end outside detector.
         The muon is created inside the hull but exits before stopping.
 
     ``stopping_track``
-        birth outside detector  AND  end inside detector.
+        start outside detector  AND  end inside detector.
         The muon enters the hull from outside and stops inside.
 
     ``through_going``
-        birth outside detector  AND  end outside detector
-        AND the MMC segment (xi→xf) intersects the hull.
+        start outside detector  AND  end outside detector
+        AND the selected muon segment intersects the hull.
         The muon passes through the hull without stopping inside.
 
     ``missed_track``
-        birth outside detector  AND  end outside detector
-        AND the MMC segment (xi→xf) does not intersect the hull.
+        start outside detector  AND  end outside detector
+        AND the selected muon segment does not intersect the hull.
         The muon never enters the detector volume.
     """
+
+    _TRIGGER_FIELDS = [
+        "triggered_noisy_340_string",
+        "trigger_time_noisy_340_string",
+        "triggered_noisy_160_string",
+        "trigger_time_noisy_160_string",
+        "triggered_noisy_102_string",
+        "trigger_time_noisy_102_string",
+        "triggered_nonoise_340_string",
+        "trigger_time_nonoise_340_string",
+        "triggered_nonoise_160_string",
+        "trigger_time_nonoise_160_string",
+        "triggered_nonoise_102_string",
+        "trigger_time_nonoise_102_string",
+    ]
 
     def __init__(
         self,
@@ -686,7 +702,7 @@ class I3TruthExtractorPONE(I3Extractor):
             "position_y":       padding_value,
             "position_z":       padding_value,
             "pid":              padding_value,
-            "interaction_type": padding_value,
+            "is_CC":           padding_value,
             "totalEnergy":      padding_value,
             "zenith":           padding_value,
             "azimuth":          padding_value,
@@ -697,16 +713,23 @@ class I3TruthExtractorPONE(I3Extractor):
             "initialType":      padding_value,
             "totalColumnDepth": padding_value,
             "impactParameter":  padding_value,
-            "category2": padding_value,
-            # Muon containment flags (NuMu/NuMuBar CC only — see class docstring)
+            "category2_tauCC_others_muonCC": padding_value,
+            "category_3_contains_muon": padding_value,
+            # 1 when the EventProperties vertex is inside the detector hull.
+            "vertex_inside_hull": padding_value,
+            # Muon containment flags (set only when postprop contains a muon).
             "fully_contained": padding_value,
             "starting_track":  padding_value,
             "stopping_track":  padding_value,
             "through_going":   padding_value,
             "missed_track":    padding_value,
-            # Track vs cascade: 1 for NuMu/NuMuBar CC, 0 otherwise
-            "category1":       padding_value,
+            # 1 for NuMu/NuMuBar charged-current events, 0 otherwise.
+            "category1_isMuonCC": padding_value,
         }
+        output.update(
+            {field: padding_value for field in self._TRIGGER_FIELDS}
+        )
+        output.update(self._extract_trigger_fields(frame, padding_value))
 
         if len(frame) == 0:
             print("[I3TruthExtractorPONE] Empty frame, skipping.")
@@ -747,60 +770,87 @@ class I3TruthExtractorPONE(I3Extractor):
                 "finalType1": ep.finalType1,
                 "finalType2": ep.finalType2,
                 "initialType": ep.initialType,
-                "interaction_type": self._get_interaction_type(ep),
+                "is_CC": self._get_is_cc(ep),
             }
         )
-        output["category2"] = self._get_category2(
+        vertex = np.array([ep.x, ep.y, ep.z], dtype=float)
+        output["vertex_inside_hull"] = int(self._inside_detector(vertex))
+        output["category2_tauCC_others_muonCC"] = self._get_category2(
             pid=output["pid"],
-            interaction_type=output["interaction_type"],
+            is_CC=output["is_CC"],
             padding_value=padding_value,
         )
+        output["category_3_contains_muon"] = int(self._contains_muon(frame))
         try:
             output["totalColumnDepth"] = ep.totalColumnDepth
             output["impactParameter"] = ep.impactParameter
         except AttributeError:
             pass
 
-        output["category1"] = int(
-            abs(output["pid"]) == 14 and output["interaction_type"] == 1
+        output["category1_isMuonCC"] = int(
+            abs(output["pid"]) == 14 and output["is_CC"] == 1
         )
 
-        # Containment flags — only for NuMu/NuMuBar CC events (muon tracks)
-        if abs(int(ep.initialType)) == 14:
-            mmc_list = frame["MMCTrackList"] if "MMCTrackList" in frame else []
+        # Containment is evaluated for events with any postprop muon,
+        # independently of the primary-neutrino category labels.
+        if output["category_3_contains_muon"] == 1:
+            start, end = self._get_postprop_muon_track(frame)
 
-            if len(mmc_list) > 0:
-                mmc = mmc_list[0]
-                birth  = np.array([ep.x, ep.y, ep.z])
-                mmc_entry = np.array([mmc.xi, mmc.yi, mmc.zi])
-                end    = np.array([mmc.xf, mmc.yf, mmc.zf])
+            start_inside = self._inside_detector(start)
+            end_inside = self._inside_detector(end)
+            intersects = self._segment_intersects_hull(start, end)
 
-                birth_inside = self._inside_detector(birth)
-                end_inside   = self._inside_detector(end)
-
-                through_going, missed_track = 0, 0
-                if not birth_inside and not end_inside:
-                    passes = any(
-                        self._inside_detector(mmc_entry + t * (end - mmc_entry))
-                        for t in np.linspace(0, 1, 100)
-                    )
-                    through_going = int(passes)
-                    missed_track  = int(not passes)
-
-                output.update(
-                    {
-                        "fully_contained": int(birth_inside and end_inside),
-                        "starting_track":  int(birth_inside and not end_inside),
-                        "stopping_track":  int(not birth_inside and end_inside),
-                        "through_going":   through_going,
-                        "missed_track":    missed_track,
-                    }
-                )
+            output.update(
+                {
+                    "fully_contained": int(start_inside and end_inside),
+                    "starting_track": int(start_inside and not end_inside),
+                    "stopping_track": int(not start_inside and end_inside),
+                    "through_going": int(
+                        not start_inside and not end_inside and intersects
+                    ),
+                    "missed_track": int(
+                        not start_inside and not end_inside and not intersects
+                    ),
+                }
+            )
 
         return output
 
-    def _get_interaction_type(self, ep: Any) -> int:
-        """Return 1 (CC) or 2 (NC) based on EventProperties finalType1."""
+    def _extract_trigger_fields(
+        self, frame: "icetray.I3Frame", padding_value: Any = -1
+    ) -> Dict[str, Any]:
+        """Extract noisy/nonoise trigger flags and trigger times from frame."""
+        output = {}
+        for key in self._TRIGGER_FIELDS:
+            output[key] = self._frame_value(frame, key, padding_value)
+        return output
+
+    def _frame_value(
+        self, frame: "icetray.I3Frame", key: str, padding_value: Any = -1
+    ) -> Any:
+        """Return a scalar frame value when present, otherwise padding."""
+        if key not in frame:
+            return padding_value
+
+        value = frame[key]
+        if hasattr(value, "value"):
+            value = value.value
+
+        if isinstance(value, (bool, int, float, str)) or value is None:
+            return value
+
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _get_is_cc(self, ep: Any) -> int:
+        """Return 1 for charged-current and 0 for neutral-current events."""
         neutrinos = [
             dataclasses.I3Particle.NuE,
             dataclasses.I3Particle.NuMu,
@@ -809,17 +859,134 @@ class I3TruthExtractorPONE(I3Extractor):
             dataclasses.I3Particle.NuMuBar,
             dataclasses.I3Particle.NuTauBar,
         ]
-        return 2 if ep.finalType1 in neutrinos else 1
+        return 0 if ep.finalType1 in neutrinos else 1
+
+    def _contains_muon(self, frame: "icetray.I3Frame") -> bool:
+        """Return True if I3MCTree_postprop contains a MuMinus or MuPlus."""
+        if "I3MCTree_postprop" not in frame:
+            return False
+
+        return any(
+            abs(int(particle.pdg_encoding)) == 13
+            for particle in frame["I3MCTree_postprop"]
+        )
+
+    def _is_muon(self, particle: "dataclasses.I3Particle") -> bool:
+        """Return True if particle is MuMinus or MuPlus."""
+        return abs(int(particle.pdg_encoding)) == 13
+
+    def _get_fresh_muon(
+        self, frame: "icetray.I3Frame"
+    ) -> "dataclasses.I3Particle":
+        """Return the only muon whose parent is not a muon."""
+        tree = frame["I3MCTree_postprop"]
+        candidates = []
+
+        for particle in tree:
+            if not self._is_muon(particle):
+                continue
+
+            try:
+                parent = tree.parent(particle)
+                parent_is_muon = self._is_muon(parent)
+            except Exception:
+                parent_is_muon = False
+
+            if not parent_is_muon:
+                candidates.append(particle)
+
+        if not candidates:
+            raise RuntimeError(
+                "I3TruthExtractorPONE: category_3_contains_muon=1, but no fresh muon "
+                "was found in I3MCTree_postprop. Expected a MuMinus/MuPlus "
+                "whose parent is not MuMinus/MuPlus."
+            )
+
+        if len(candidates) > 1:
+            candidate_summary = ", ".join(
+                f"{particle.type}(pdg={int(particle.pdg_encoding)}, "
+                f"energy={particle.energy})"
+                for particle in candidates
+            )
+            raise RuntimeError(
+                "I3TruthExtractorPONE: expected exactly one fresh muon in "
+                "I3MCTree_postprop, but found "
+                f"{len(candidates)}. A fresh muon is defined as MuMinus/MuPlus "
+                "whose parent is not MuMinus/MuPlus. Ambiguous candidates: "
+                f"{candidate_summary}."
+            )
+
+        return candidates[0]
+
+    def _get_postprop_muon_track(
+        self, frame: "icetray.I3Frame"
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return start and end points for the selected postprop muon track."""
+        muon = self._get_fresh_muon(frame)
+
+        try:
+            length = float(muon.length)
+        except RuntimeError as e:
+            raise RuntimeError(
+                "I3TruthExtractorPONE: selected fresh muon length could not "
+                "be read. Cannot compute postprop muon track endpoint."
+            ) from e
+
+        if not np.isfinite(length):
+            raise RuntimeError(
+                "I3TruthExtractorPONE: selected fresh muon has invalid "
+                f"length (length={length}). Cannot compute postprop muon "
+                "track endpoint."
+            )
+
+        start = np.array([muon.pos.x, muon.pos.y, muon.pos.z], dtype=float)
+        direction = np.array(
+            [muon.dir.x, muon.dir.y, muon.dir.z], dtype=float
+        )
+        end = start + direction * length
+
+        return start, end
+
+    def _segment_intersects_hull(
+        self, start: np.ndarray, end: np.ndarray, eps: float = 1e-9
+    ) -> bool:
+        """Return True if a line segment intersects the detector convex hull."""
+        direction = end - start
+        t_min = 0.0
+        t_max = 1.0
+
+        for equation in self.hull.equations:
+            normal = equation[:3]
+            offset = equation[3]
+            start_distance = np.dot(normal, start) + offset
+            direction_distance = np.dot(normal, direction)
+
+            if abs(direction_distance) < eps:
+                if start_distance > eps:
+                    return False
+                continue
+
+            t = -start_distance / direction_distance
+
+            if direction_distance > 0:
+                t_max = min(t_max, t)
+            else:
+                t_min = max(t_min, t)
+
+            if t_min - t_max > eps:
+                return False
+
+        return True
 
     def _get_category2(
-        self, pid: int, interaction_type: int, padding_value: Any = -1
+        self, pid: int, is_CC: int, padding_value: Any = -1
     ) -> int:
         """Return numeric PONE class: tau_CC=0, cascade=1, muon_CC=2."""
-        if interaction_type == 2 or abs(pid) == 12:
+        if is_CC == 0 or abs(pid) == 12:
             return 1
-        if abs(pid) == 14 and interaction_type == 1:
+        if abs(pid) == 14 and is_CC == 1:
             return 2
-        if abs(pid) == 16 and interaction_type == 1:
+        if abs(pid) == 16 and is_CC == 1:
             return 0
         return padding_value
 

@@ -1,0 +1,146 @@
+experiment_name: baseline
+
+# Reconstruction trains one separate model per routing class and target.
+# The submit wrapper expands routing.classes x task.targets into separate
+# SLURM jobs. The train script itself only supports task.mode=separate.
+task:
+  type: reconstruction
+  mode: separate
+  targets: [energy, zenith, azimuth]
+
+# Dataset family and detector geometry. Paths are resolved through:
+#   /project/def-nahee/kbas/Graphnet-Applications/Metadata/paths.py
+mc: 340StringMC
+geometry: 102_string_emax1e6
+
+# Reconstruction is trained after classification routing. For every selected
+# class under this category, all available flavor paths are mixed for train/val.
+routing:
+  category: category_3_contains_muon
+  classes: all
+
+output:
+  # Derived target directory:
+  #   root_dir / mc / geometry / task.type / routing.category
+  #     / class<class_id> / experiment_name / dirs.train / <target>
+  root_dir: /project/def-nahee/kbas/Graphnet-Applications/Results
+  dirs:
+    train: train_and_val
+
+run:
+  # Existing target output directory behavior: error | skip | overwrite.
+  # overwrite removes the target directory before training starts.
+  existing_output: error
+
+validation:
+  # All diagnostics are computed on the validation set after loading best_model.pth.
+  write_predictions: true
+  write_summary: true
+  write_plots: true
+
+data:
+  pulsemaps: features
+  truth_table: truth
+  features: [pmt_x, pmt_y, pmt_z, dom_time, charge]
+
+  # Event ids/context plus all supported reconstruction targets.
+  truth_all:
+    - event_no
+    - RunID
+    - EventID
+    - totalEnergy
+    - zenith
+    - azimuth
+    - pid
+    - is_CC
+    - category1_isMuonCC
+    - category2_tauCC_others_muonCC
+    - category_3_contains_muon
+
+  # If null, paths.py resolves ROBUST_SCALER[mc][geometry]["reconstruction"][routing.category][route_class].
+  percentiles_csv: null
+
+weights:
+  # Per-event loss weights. If enabled, ParquetDataset reads this column and the
+  # reconstruction task passes it into the GraphNeT loss function.
+  enabled: false
+  loss_weight_table: truth
+  loss_weight_column: event_weight
+  loss_weight_default_value: 1.0
+
+training:
+  seed: 20260202
+  max_epochs: 30
+  early_stopping_patience: 5
+  batch_size: 256
+  accumulate_grad_batches: 4
+  base_lr: 1.0e-5
+  peak_lr: 2.0e-3
+  warmup_fraction: 0.5
+  num_workers: 8
+  multiprocessing_context: spawn
+  pin_memory: true
+  val_metrics_max_batches: null
+  pretrained_weights: null
+
+model:
+  name: dynedge
+  nb_neighbours: 8
+  global_pooling_schemes: [min, max, mean, sum]
+  add_global_variables_after_pooling: true
+  add_norm_layer: false
+  skip_readout: false
+  transform_support: [10.0, 1.0e+8]
+
+target_settings:
+  energy:
+    loss: log_cosh
+    target_labels: [totalEnergy]
+    prediction_labels: [log10_energy_pred]
+    transform_target: log10
+    transform_inference: pow10
+    metrics: energy_log10
+
+  zenith:
+    loss: von_mises_fisher_2d
+    target_labels: [zenith]
+    prediction_labels: [zenith_pred, zenith_kappa]
+    metrics: angle_deg
+
+  azimuth:
+    loss: von_mises_fisher_2d
+    target_labels: [azimuth]
+    prediction_labels: [azimuth_pred, azimuth_kappa]
+    metrics: angle_deg
+
+target_overrides:
+  # Set enabled=true to override training/model/target_settings per target.
+  enabled: false
+  energy:
+    training: {}
+    model: {}
+    target_settings: {}
+  zenith:
+    training: {}
+    model: {}
+    target_settings: {}
+  azimuth:
+    training: {}
+    model: {}
+    target_settings: {}
+
+slurm:
+  account: def-nahee
+  time: "24:00:00"
+  mem: 64G
+  cpus_per_task: 8
+  gpus_per_node: nvidia_h100_80gb_hbm3_3g.40gb:1
+  exclude: fc10713
+
+slurm_overrides:
+  # Separate sbatch jobs are submitted for each class-target pair, so target-level
+  # SLURM resources can be enabled later without changing the train script.
+  enabled: false
+  energy: {}
+  zenith: {}
+  azimuth: {}

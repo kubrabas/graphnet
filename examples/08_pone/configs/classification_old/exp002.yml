@@ -1,4 +1,4 @@
-experiment_name: exp004
+experiment_name: exp002
 
 # Generic task block.
 # type options:
@@ -14,9 +14,9 @@ task:
   mode: multiclass
 
   # Truth-table column used as the target.
-  target: category2
+  target: category2_tauCC_others_muonCC
 
-  # Numeric class ids. category2 maps:
+  # Numeric class ids. category2_tauCC_others_muonCC maps:
   #   0 -> tau_CC
   #   1 -> all NC + electron CC
   #   2 -> muon_CC
@@ -37,7 +37,7 @@ task:
 # paths through:
 #   /project/def-nahee/kbas/Graphnet-Applications/Metadata/paths.py
 mc: 340StringMC
-geometry: full_geometry_emax1e6
+geometry: 102_string_emax1e6
 
 # Flavor/sample groups to include. Available options depend on paths.py.
 flavors: [Muon, Electron, Tau, NC]
@@ -50,7 +50,7 @@ output:
   #
   # Example:
   #   /project/def-nahee/kbas/Graphnet-Applications/Results
-  #     /340StringMC/full_geometry_emax1e6/classification/category2/exp004
+  #     /340StringMC/102_string_emax1e6/classification/category2_tauCC_others_muonCC/exp002
   root_dir: /project/def-nahee/kbas/Graphnet-Applications/Results
 
   # Training and validation artifacts go under:
@@ -68,11 +68,6 @@ output:
   #   validation_confusion_matrix_closest_top_left.png
   dirs:
     train: train_and_val
-
-run:
-  # Existing target output directory behavior: error | skip | overwrite.
-  # overwrite removes the train_and_val directory before training starts.
-  existing_output: error
 
 # Classification validation diagnostics.
 #
@@ -121,12 +116,13 @@ data:
   # loss, but are useful for validation diagnostics and later inference/reco
   # studies, e.g. checking misroutes versus totalEnergy or direction.
   truth_all:
-    - category2
+    - category2_tauCC_others_muonCC
+    - category_3_contains_muon
     - totalEnergy
     - zenith
     - azimuth
     - pid
-    - interaction_type
+    - is_CC
 
   # Robust-scaler percentiles used by the PONE detector transform.
   # If null, pipeline_utils resolves the mixed scaler from paths.py:
@@ -184,11 +180,3 @@ model:
   add_global_variables_after_pooling: true
   add_norm_layer: false
   skip_readout: false
-
-slurm:
-  account: def-nahee
-  time: "24:00:00"
-  mem: 64G
-  cpus_per_task: 8
-  gpus_per_node: nvidia_h100_80gb_hbm3_3g.40gb:1
-  exclude: fc10713

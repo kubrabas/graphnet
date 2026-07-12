@@ -6,10 +6,17 @@ events to class-specific reconstruction models for each configured target.
 """
 
 import argparse
+import ast
+import base64
+import contextlib
+import io
 import importlib.util
+import json
 import os
 import shutil
+import subprocess
 import sys
+import traceback
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -70,6 +77,47 @@ def resolve_output_dir(cfg: dict) -> Path:
     )
 
 
+def resolve_classification_checkpoint(cfg: dict, cls_cfg: dict) -> str:
+    explicit = cfg.get("classification", {}).get("best_model")
+    if explicit:
+        return explicit
+    return str(
+        Path(cfg["output"]["root_dir"])
+        / cfg["mc"]
+        / cfg["geometry"]
+        / "classification"
+        / cls_cfg["task"]["target"]
+        / cfg["classification"].get("experiment_name", "baseline")
+        / cls_cfg["output"]["dirs"]["train"]
+        / "best_model.pth"
+    )
+
+
+def resolve_reconstruction_checkpoint(
+    cfg: dict, reco_cfg: dict, route_class: str, target: str
+) -> str:
+    explicit = (
+        cfg.get("reconstruction", {})
+        .get("models", {})
+        .get(str(route_class), {})
+        .get(target)
+    )
+    if explicit:
+        return explicit
+    return str(
+        Path(cfg["output"]["root_dir"])
+        / cfg["mc"]
+        / cfg["geometry"]
+        / "reconstruction"
+        / cfg["routing"]["category"]
+        / f"class{route_class}"
+        / cfg["reconstruction"].get("experiment_name", "baseline")
+        / reco_cfg["output"]["dirs"]["train"]
+        / target
+        / "best_model.pth"
+    )
+
+
 def handle_existing_output(out_dir: Path, policy: str) -> None:
     if not out_dir.exists():
         return
@@ -118,21 +166,37 @@ def resolve_percentiles(cfg: dict, route_class: str | None = None) -> str:
     mod = load_paths_module()
     robust_scaler = getattr(mod, "ROBUST_SCALER")
     if route_class is None:
-        key = "mixed"
+        percentiles_csv = (
+            robust_scaler.get(cfg["mc"], {})
+            .get(cfg["geometry"], {})
+            .get("classification")
+        )
+        key_path = "classification"
     else:
-        key = f"{cfg['routing']['category']}_mixed_{route_class}"
-    percentiles_csv = robust_scaler.get(cfg["mc"], {}).get(cfg["geometry"], {}).get(key)
+        category = cfg["routing"]["category"]
+        percentiles_csv = (
+            robust_scaler.get(cfg["mc"], {})
+            .get(cfg["geometry"], {})
+            .get("reconstruction", {})
+            .get(category, {})
+            .get(str(route_class))
+        )
+        key_path = f"reconstruction.{category}.{route_class}"
     if not percentiles_csv:
-        raise ValueError(f"ROBUST_SCALER['{cfg['mc']}']['{cfg['geometry']}']['{key}'] is missing")
+        raise ValueError(
+            f"ROBUST_SCALER['{cfg['mc']}']['{cfg['geometry']}']"
+            f"[{key_path}] is missing"
+        )
     return percentiles_csv
 
 
 def build_loader(cfg: dict, paths: Dict[str, str], percentiles_csv: str, model_cfg: dict):
     features = cfg["data"]["features"]
+    task_target = model_cfg.get("task", {}).get("target")
     truth_all = [
         field
-        for field in unique([*EVENT_ID_FIELDS, *cfg["data"]["truth_all"]])
-        if field != "event_no"
+        for field in unique([*EVENT_ID_FIELDS, *cfg["data"]["truth_all"], task_target])
+        if field and field != "event_no"
     ]
     loader_cfg = cfg["inference"]
 
@@ -212,7 +276,11 @@ def run_classification(cfg: dict, cls_cfg: dict, paths: Dict[str, str]) -> pd.Da
     percentiles_csv = resolve_percentiles(cfg, route_class=None)
     data_representation, loader = build_loader(cfg, paths, percentiles_csv, cls_cfg)
     model = build_classification_model(cls_cfg, data_representation, steps_per_epoch_optimizer=1)
-    load_state_dict(model, cfg["classification"]["best_model"], "classification")
+    load_state_dict(
+        model,
+        resolve_classification_checkpoint(cfg, cls_cfg),
+        "classification",
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     labels = list(cls_cfg["task"]["labels"])
@@ -245,7 +313,6 @@ def run_classification(cfg: dict, cls_cfg: dict, paths: Dict[str, str]) -> pd.Da
                 "true_classification_class": field_numpy(batch, target, n),
                 "predicted_route_class": pred_label,
             }
-            row[f"true_{target}"] = field_numpy(batch, target, n)
             for idx, label in enumerate(labels):
                 row[f"{prefix}_{label}"] = probs[:, idx]
             rows.append(pd.DataFrame(row))
@@ -257,7 +324,9 @@ def run_classification(cfg: dict, cls_cfg: dict, paths: Dict[str, str]) -> pd.Da
 
 def build_reconstruction_model_for_target(cfg: dict, reco_cfg: dict, target: str, route_class: str, data_representation):
     model = build_reconstruction_model(reco_cfg, data_representation, steps_per_epoch_optimizer=1, target=target)
-    checkpoint = cfg["reconstruction"]["models"][str(route_class)][target]
+    checkpoint = resolve_reconstruction_checkpoint(
+        cfg, reco_cfg, route_class, target
+    )
     load_state_dict(model, checkpoint, f"reconstruction class{route_class} {target}")
     return model
 
@@ -286,6 +355,7 @@ def reco_prediction_frame(cfg: dict, reco_cfg: dict, target: str, route_class: s
                 base.update(
                     {
                         "true_energy": true_energy,
+                        "true_log10_energy": np.log10(true_energy),
                         "pred_energy": np.power(10.0, pred_log10),
                         "pred_log10_energy": pred_log10,
                     }
@@ -348,6 +418,7 @@ def make_wide_predictions(cls_df: pd.DataFrame, reco_df: pd.DataFrame) -> pd.Dat
         return wide
 
     for target, target_df in reco_df.groupby("target", sort=False):
+        target_df = target_df.dropna(axis=1, how="all")
         drop_cols = {"route_class", "target"}
         pred_cols = [
             col for col in target_df.columns
@@ -377,11 +448,64 @@ def validate_config(cfg: dict, cls_cfg: dict, reco_cfg: dict) -> None:
     missing = [route_class for route_class in cfg["routing"]["classes"] if str(route_class) not in labels]
     if missing:
         raise ValueError(f"routing.classes not present in classification labels: {missing}")
+    if cls_cfg["task"]["target"] != cfg["routing"]["category"]:
+        raise ValueError(
+            "Classification target must match inference routing.category"
+        )
+
+
+def preflight(cfg: dict, cls_cfg: dict, reco_cfg: dict) -> None:
+    paths = resolve_mixed_split_paths(cfg)
+    missing = []
+    classification_checkpoint = resolve_classification_checkpoint(cfg, cls_cfg)
+    if not Path(classification_checkpoint).is_file():
+        missing.append(f"classification checkpoint: {classification_checkpoint}")
+    classification_validation = (
+        Path(classification_checkpoint).parent / "validation_metrics_summary.csv"
+    )
+    if not classification_validation.is_file():
+        missing.append(
+            f"completed classification validation: {classification_validation}"
+        )
+
+    classification_scaler = resolve_percentiles(cfg)
+    if not Path(classification_scaler).is_file():
+        missing.append(f"classification scaler: {classification_scaler}")
+
     for route_class in cfg["routing"]["classes"]:
-        models = cfg["reconstruction"]["models"].get(str(route_class), {})
+        route_class = str(route_class)
+        scaler = resolve_percentiles(cfg, route_class)
+        if not Path(scaler).is_file():
+            missing.append(f"class{route_class} scaler: {scaler}")
         for target in cfg["reconstruction"]["targets"]:
-            if target not in models:
-                raise ValueError(f"Missing reconstruction.models.{route_class}.{target}")
+            checkpoint = resolve_reconstruction_checkpoint(
+                cfg, reco_cfg, route_class, str(target)
+            )
+            if not Path(checkpoint).is_file():
+                missing.append(
+                    f"class{route_class} {target} checkpoint: {checkpoint}"
+                )
+            validation = Path(checkpoint).parent / "validation_metrics_summary.csv"
+            if not validation.is_file():
+                missing.append(
+                    f"completed class{route_class} {target} validation: {validation}"
+                )
+
+    notebook_cfg = cfg.get("notebook", {}) or {}
+    if notebook_cfg.get("enabled", False):
+        template = Path(notebook_cfg["template"])
+        if not template.is_file():
+            missing.append(f"notebook template: {template}")
+
+    if missing:
+        raise FileNotFoundError(
+            "Inference preflight failed:\n  - " + "\n  - ".join(missing)
+        )
+    print(
+        f"[Preflight] ready: {len(paths)} test paths, "
+        f"{len(cfg['routing']['classes'])} route classes, "
+        f"{len(cfg['reconstruction']['targets'])} reconstruction targets"
+    )
 
 
 def unique(items: Iterable) -> List:
@@ -390,6 +514,189 @@ def unique(items: Iterable) -> List:
         if item not in out:
             out.append(item)
     return out
+
+
+def _replace_notebook_placeholders(path: Path, replacements: Dict[str, str]) -> None:
+    with open(path) as f:
+        notebook = json.load(f)
+    for cell in notebook.get("cells", []):
+        source = cell.get("source", [])
+        if isinstance(source, str):
+            text = source
+        else:
+            text = "".join(source)
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        cell["source"] = text.splitlines(keepends=True)
+    with open(path, "w") as f:
+        json.dump(notebook, f, indent=1)
+        f.write("\n")
+
+
+def _execute_notebook_inprocess(path: Path) -> None:
+    """Execute a simple report notebook without requiring jupyter/nbconvert."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    with open(path) as f:
+        notebook = json.load(f)
+
+    namespace = {
+        "__name__": "__main__",
+        "__file__": str(path),
+    }
+    execution_count = 1
+
+    for cell in notebook.get("cells", []):
+        if cell.get("cell_type") != "code":
+            continue
+
+        source = "".join(cell.get("source", []))
+        cell["execution_count"] = execution_count
+        execution_count += 1
+        outputs = []
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                tree = ast.parse(source, filename=str(path), mode="exec")
+                last_expr = tree.body[-1] if tree.body and isinstance(tree.body[-1], ast.Expr) else None
+                if last_expr is not None:
+                    exec_body = tree.body[:-1]
+                    if exec_body:
+                        exec_code = compile(
+                            ast.Module(body=exec_body, type_ignores=[]),
+                            filename=str(path),
+                            mode="exec",
+                        )
+                        exec(exec_code, namespace)
+                    expr_code = compile(
+                        ast.Expression(body=last_expr.value),
+                        filename=str(path),
+                        mode="eval",
+                    )
+                    result = eval(expr_code, namespace)
+                else:
+                    exec_code = compile(tree, filename=str(path), mode="exec")
+                    exec(exec_code, namespace)
+                    result = None
+
+            if stdout.getvalue():
+                outputs.append({"output_type": "stream", "name": "stdout", "text": stdout.getvalue()})
+            if stderr.getvalue():
+                outputs.append({"output_type": "stream", "name": "stderr", "text": stderr.getvalue()})
+
+            for fig_num in plt.get_fignums():
+                fig = plt.figure(fig_num)
+                buffer = io.BytesIO()
+                fig.savefig(buffer, format="png", bbox_inches="tight")
+                outputs.append(
+                    {
+                        "output_type": "display_data",
+                        "metadata": {},
+                        "data": {
+                            "image/png": base64.b64encode(buffer.getvalue()).decode("ascii")
+                        },
+                    }
+                )
+                plt.close(fig)
+
+            if result is not None:
+                data = {"text/plain": repr(result)}
+                if hasattr(result, "_repr_html_"):
+                    html = result._repr_html_()
+                    if html is not None:
+                        data["text/html"] = html
+                outputs.append(
+                    {
+                        "output_type": "execute_result",
+                        "execution_count": cell["execution_count"],
+                        "metadata": {},
+                        "data": data,
+                    }
+                )
+
+        except Exception as exc:
+            tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
+            if stdout.getvalue():
+                outputs.append({"output_type": "stream", "name": "stdout", "text": stdout.getvalue()})
+            if stderr.getvalue():
+                outputs.append({"output_type": "stream", "name": "stderr", "text": stderr.getvalue()})
+            outputs.append(
+                {
+                    "output_type": "error",
+                    "ename": type(exc).__name__,
+                    "evalue": str(exc),
+                    "traceback": tb,
+                }
+            )
+            cell["outputs"] = outputs
+            with open(path, "w") as f:
+                json.dump(notebook, f, indent=1)
+                f.write("\n")
+            raise
+
+        cell["outputs"] = outputs
+
+    with open(path, "w") as f:
+        json.dump(notebook, f, indent=1)
+        f.write("\n")
+
+
+def run_report_notebook(cfg: dict, out_dir: Path, predictions_csv: Path) -> None:
+    notebook_cfg = cfg.get("notebook", {}) or {}
+    if not notebook_cfg.get("enabled", False):
+        return
+
+    template = Path(notebook_cfg["template"]).expanduser()
+    if not template.exists():
+        raise FileNotFoundError(f"Notebook template not found: {template}")
+
+    output_name = notebook_cfg.get("output_name", "inference_report.ipynb")
+    output_path = out_dir / output_name
+    timeout = int(notebook_cfg.get("timeout_seconds", 1800))
+    allow_failure = bool(notebook_cfg.get("allow_failure", False))
+    command = notebook_cfg.get("command", "jupyter")
+
+    shutil.copy2(template, output_path)
+    _replace_notebook_placeholders(
+        output_path,
+        {
+            "__INFERENCE_PREDICTIONS_CSV__": str(predictions_csv),
+            "__PIPELINE_CONFIG_YML__": str(out_dir / "pipeline_config.yml"),
+            "__INFERENCE_OUTPUT_DIR__": str(out_dir),
+        },
+    )
+
+    cmd = [
+        command,
+        "nbconvert",
+        "--to",
+        "notebook",
+        "--execute",
+        "--inplace",
+        str(output_path),
+        f"--ExecutePreprocessor.timeout={timeout}",
+    ]
+    print(f"[Notebook] executing report: {output_path}")
+    try:
+        subprocess.run(cmd, check=True)
+    except Exception as exc:
+        print(f"[Notebook] nbconvert failed: {exc}")
+        print("[Notebook] falling back to in-process notebook execution")
+        try:
+            _execute_notebook_inprocess(output_path)
+            print(f"[Notebook] executed report with fallback: {output_path}")
+            return
+        except Exception as fallback_exc:
+            print(f"[Notebook] fallback execution failed: {fallback_exc}")
+        if allow_failure:
+            print("[Notebook] report failed but allow_failure=true")
+            return
+        raise
 
 
 def main() -> None:
@@ -401,6 +708,7 @@ def main() -> None:
     cls_cfg = load_yaml(cfg["classification"]["config"])
     reco_cfg = load_yaml(cfg["reconstruction"]["config"])
     validate_config(cfg, cls_cfg, reco_cfg)
+    preflight(cfg, cls_cfg, reco_cfg)
 
     out_dir = resolve_output_dir(cfg)
     if os.environ.get("OUTPUT_PREPARED", "0") != "1":
@@ -415,11 +723,21 @@ def main() -> None:
 
     paths = resolve_mixed_split_paths(cfg)
     cls_df = run_classification(cfg, cls_cfg, paths)
+    cls_df.to_csv(out_dir / "classification_predictions.csv", index=False)
+    route_counts = (
+        cls_df.groupby("predicted_route_class", dropna=False)
+        .size()
+        .rename("event_count")
+        .reset_index()
+    )
+    route_counts.to_csv(out_dir / "routed_event_counts.csv", index=False)
     reco_df = run_reconstruction(cfg, reco_cfg, paths, cls_df)
+    reco_df.to_csv(out_dir / "reconstruction_predictions.csv", index=False)
     wide = make_wide_predictions(cls_df, reco_df)
     wide_path = out_dir / "inference_predictions.csv"
     wide.to_csv(wide_path, index=False)
     print(f"[Output] wrote {wide_path}")
+    run_report_notebook(cfg, out_dir, wide_path)
 
 
 if __name__ == "__main__":

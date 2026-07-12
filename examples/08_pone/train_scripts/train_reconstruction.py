@@ -7,11 +7,11 @@ it expands the config into class x target jobs and calls this worker script.
 
 Normal usage:
     python3 /home/kbas/SlurmScripts/GraphNet/submit_reconstruction_pipeline.py \
-        -c /project/def-nahee/kbas/graphnet/examples/08_pone/configs/reconstruction/exp001.yml
+        -c /project/def-nahee/kbas/graphnet/examples/08_pone/configs/reconstruction/102_string_emax1e6__category1_isMuonCC.yml
 
 Worker usage, normally called by the SLURM wrapper:
     python3 train_reconstruction.py \
-        --config examples/08_pone/configs/reconstruction/exp001.yml \
+        --config examples/08_pone/configs/reconstruction/102_string_emax1e6__category1_isMuonCC.yml \
         --route-class 0 \
         --target energy
 """
@@ -196,8 +196,8 @@ def resolve_reconstruction_paths(cfg: dict, route_class: str):
             split_path = class_entry.get(split)
             if split_path is None:
                 raise ValueError(f"None path in paths.py: {geometry}.{flavor}.{routing_category}.{route_class}.{split}")
-            if split_path == "does_not_exit":
-                print(f"  {flavor}: does_not_exit")
+            if split_path == "does_not_exist":
+                print(f"  {flavor}: does_not_exist")
                 continue
             if not Path(split_path).exists():
                 raise FileNotFoundError(f"{flavor} {split} path does not exist: {split_path}")
@@ -214,10 +214,18 @@ def resolve_reconstruction_paths(cfg: dict, route_class: str):
     percentiles_csv = cfg["data"].get("percentiles_csv")
     if not percentiles_csv:
         robust_scaler = getattr(mod, "ROBUST_SCALER")
-        key = f"{routing_category}_mixed_{route_class}"
-        percentiles_csv = robust_scaler.get(mc, {}).get(geometry, {}).get(key)
+        percentiles_csv = (
+            robust_scaler.get(mc, {})
+            .get(geometry, {})
+            .get("reconstruction", {})
+            .get(routing_category, {})
+            .get(str(route_class))
+        )
         if not percentiles_csv:
-            raise ValueError(f"ROBUST_SCALER['{mc}']['{geometry}']['{key}'] is missing in paths.py")
+            raise ValueError(
+                f"ROBUST_SCALER['{mc}']['{geometry}']['reconstruction']"
+                f"['{routing_category}']['{route_class}'] is missing in paths.py"
+            )
     print(f"[Paths] percentiles_csv: {percentiles_csv}")
     return split_paths, percentiles_csv
 
@@ -415,6 +423,7 @@ def run_training(cfg: dict, target: str, data_representation, train_loader, val_
         accelerator="gpu",
         devices=1,
         callbacks=callbacks,
+        logger=False,
         enable_checkpointing=False,
         enable_progress_bar=False,
         accumulate_grad_batches=train_cfg["accumulate_grad_batches"],
@@ -466,9 +475,10 @@ def collect_validation_predictions(cfg: dict, model, val_loader, target: str, ro
                 "RunID": field_or_nan(batch, "RunID", n),
                 "EventID": field_or_nan(batch, "EventID", n),
                 "pid": field_or_nan(batch, "pid", n),
-                "interaction_type": field_or_nan(batch, "interaction_type", n),
-                "category1": field_or_nan(batch, "category1", n),
-                "category2": field_or_nan(batch, "category2", n),
+                "is_CC": field_or_nan(batch, "is_CC", n),
+                "category1_isMuonCC": field_or_nan(batch, "category1_isMuonCC", n),
+                "category2_tauCC_others_muonCC": field_or_nan(batch, "category2_tauCC_others_muonCC", n),
+                "category_3_contains_muon": field_or_nan(batch, "category_3_contains_muon", n),
             }
 
             if target == "energy":
@@ -640,7 +650,7 @@ def validate_config(cfg: dict, target: str) -> None:
     if target not in cfg["task"]["targets"]:
         raise ValueError(f"Target {target!r} is not listed in task.targets")
     target_labels = cfg.get("target_settings", {}).get(target, {}).get("target_labels", [target])
-    required_truth = ["event_no", "RunID", "EventID", "pid", "interaction_type", "category1", "category2", *target_labels]
+    required_truth = ["event_no", "RunID", "EventID", "pid", "is_CC", "category1_isMuonCC", "category2_tauCC_others_muonCC", "category_3_contains_muon", *target_labels]
     missing = [field for field in required_truth if field not in cfg["data"]["truth_all"]]
     if missing:
         raise ValueError(f"data.truth_all is missing required fields: {missing}")

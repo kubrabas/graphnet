@@ -1,0 +1,76 @@
+experiment_name: baseline
+
+task:
+  type: classification
+  mode: binary
+  target: category1_isMuonCC
+  labels: [0, 1]
+  prediction_prefix: p_class
+  class_names:
+    0: not_muon_cc
+    1: muon_cc
+
+mc: 340StringMC
+geometry: 160_string_emax1e6
+flavors: [Muon, Electron, Tau, NC]
+
+output:
+  root_dir: /project/def-nahee/kbas/Graphnet-Applications/Results
+  dirs:
+    train: train_and_val
+
+run:
+  existing_output: error
+
+data:
+  pulsemaps: features
+  truth_table: truth
+  features: [pmt_x, pmt_y, pmt_z, dom_time, charge]
+  truth_all:
+    - category1_isMuonCC
+    - category2_tauCC_others_muonCC
+    - category_3_contains_muon
+    - totalEnergy
+    - zenith
+    - azimuth
+    - pid
+    - is_CC
+  # Resolved as ROBUST_SCALER[mc][geometry]["classification"].
+  percentiles_csv: null
+
+weights:
+  enabled: false
+  loss_weight_table: null
+  loss_weight_column: null
+  loss_weight_default_value: 1.0
+
+training:
+  seed: 20260202
+  max_epochs: 30
+  early_stopping_patience: 5
+  batch_size: 256
+  accumulate_grad_batches: 4
+  base_lr: 1.0e-6
+  peak_lr: 1.0e-4
+  warmup_fraction: 0.5
+  num_workers: 8
+  multiprocessing_context: spawn
+  pin_memory: true
+  val_metrics_max_batches: null
+  pretrained_weights: null
+
+model:
+  name: dynedge
+  nb_neighbours: 8
+  global_pooling_schemes: [min, max, mean, sum]
+  add_global_variables_after_pooling: true
+  add_norm_layer: false
+  skip_readout: false
+
+slurm:
+  account: def-nahee
+  time: "36:00:00"
+  mem: 96G
+  cpus_per_task: 8
+  gpus_per_node: nvidia_h100_80gb_hbm3_3g.40gb:1
+  exclude: fc10713

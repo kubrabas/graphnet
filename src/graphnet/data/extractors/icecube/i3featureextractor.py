@@ -32,63 +32,124 @@ class I3FeatureExtractor(I3Extractor):
 
 
 class I3FeatureExtractorPONE(I3Extractor):
-    """Class for extracting reconstructed features for P-ONE events created with LeptonInjector."""
+    """Class for extracting reconstructed features for P-ONE events created with LeptonInjector.
+
+    Args:
+        pulsemap: Name of the pulse map to extract.
+        name: Name assigned to this extractor.
+        exclude: List of keys to exclude from the extracted data.
+        pone_offline_version: P-ONE offline geometry convention used when the
+            PMT response was produced. Version 2 used ``POMModel`` coordinates
+            with a 90 degree rotation around the x-axis during PMT assignment;
+            version 3 and later use ``PMTAcceptance`` coordinates directly, with
+            no extra rotation.
+    """
 
     def __init__(
         self,
         pulsemap: str,
         name: str = "feature",
         exclude: list = [None],
+        pone_offline_version: str = "v3",
     ):
         self._pulsemap = pulsemap
+        self._pone_offline_version = pone_offline_version.lower().lstrip("v")
+        try:
+            self._pone_offline_major_version = int(
+                self._pone_offline_version.split(".", maxsplit=1)[0]
+            )
+        except ValueError as e:
+            raise ValueError(
+                "Unsupported pone_offline_version: "
+                f"{pone_offline_version}. Expected 'v2' or 'v3'."
+            ) from e
 
         # Base class constructor
         super().__init__(extractor_name=name, exclude=exclude)
         self._extractor_name = name
 
-
-        # PMT angles (elevation, azimuth) in degrees, as defined in POMModel (pone_offline v2)
-        pmt_angles = np.array(
-            [
-                [57.5, 270.],   # PMT 1
-                [57.5, 0.],     # PMT 2
-                [57.5, 90.],    # PMT 3
-                [57.5, 180.],   # PMT 4
-                [25., 225.],    # PMT 5
-                [25., 315.],    # PMT 6
-                [25., 45.],     # PMT 7
-                [25., 135.],    # PMT 8
-                [-57.5, 270.],  # PMT 9
-                [-57.5, 180.],  # PMT 10
-                [-57.5, 90.],   # PMT 11
-                [-57.5, 0.],    # PMT 12
-                [-25., 315.],   # PMT 13
-                [-25., 225.],   # PMT 14
-                [-25., 135.],   # PMT 15
-                [-25., 45.],    # PMT 16
-            ]
-        )
-
         # valid in both mc production campaigns
         module_radius_m = 0.2159
 
-        pmt_matrix_pom_frame = np.array(
-            [
-                np.multiply(np.sin(np.deg2rad(90.0 - pmt_angles[:, 0])), np.cos(np.deg2rad(pmt_angles[:, 1]))),
-                np.multiply(np.sin(np.deg2rad(90.0 - pmt_angles[:, 0])), np.sin(np.deg2rad(pmt_angles[:, 1]))),
-                np.cos(np.deg2rad(90.0 - pmt_angles[:, 0])),
-            ]
-        ).T
+        if self._pone_offline_major_version == 2:
+            # PMT angles (elevation, azimuth) in degrees, as defined in
+            # POMModel (pone_offline v2). The coordinates are rotated back to
+            # the original detector frame below, undoing the x-axis rotation
+            # applied during v2 PMT assignment.
+            pmt_angles = np.array(
+                [
+                    [57.5, 270.],   # PMT 1
+                    [57.5, 0.],     # PMT 2
+                    [57.5, 90.],    # PMT 3
+                    [57.5, 180.],   # PMT 4
+                    [25., 225.],    # PMT 5
+                    [25., 315.],    # PMT 6
+                    [25., 45.],     # PMT 7
+                    [25., 135.],    # PMT 8
+                    [-57.5, 270.],  # PMT 9
+                    [-57.5, 180.],  # PMT 10
+                    [-57.5, 90.],   # PMT 11
+                    [-57.5, 0.],    # PMT 12
+                    [-25., 315.],   # PMT 13
+                    [-25., 225.],   # PMT 14
+                    [-25., 135.],   # PMT 15
+                    [-25., 45.],    # PMT 16
+                ]
+            )
+            pmt_matrix_pom_frame = np.array(
+                [
+                    np.sin(np.deg2rad(90.0 - pmt_angles[:, 0]))
+                    * np.cos(np.deg2rad(pmt_angles[:, 1])),
+                    np.sin(np.deg2rad(90.0 - pmt_angles[:, 0]))
+                    * np.sin(np.deg2rad(pmt_angles[:, 1])),
+                    np.cos(np.deg2rad(90.0 - pmt_angles[:, 0])),
+                ]
+            ).T
+            r_x_minus_90 = np.array(
+                [[1., 0., 0.], [0., 0., 1.], [0., -1., 0.]],
+                dtype=float,
+            )
+            pmt_matrix = pmt_matrix_pom_frame @ r_x_minus_90.T
+        elif self._pone_offline_major_version >= 3:
+            # PMT angles (zenith, azimuth) in degrees, as defined in
+            # PMTAcceptance (pone_offline v3). Version 3 redefines the PMT
+            # numbering/geometry so no v2-style coordinate rotation is applied.
+            pmt_angles = np.array(
+                [
+                    [58., 0.],
+                    [90., 328.],
+                    [122., 0.],
+                    [90., 32.],
+                    [51.37, 53.06],
+                    [51.37, 306.94],
+                    [128.63, 306.94],
+                    [128.63, 53.06],
+                    [58., 180.],
+                    [90., 148.],
+                    [122., 180.],
+                    [90., 212.],
+                    [51.37, 233.06],
+                    [51.37, 126.94],
+                    [128.63, 126.94],
+                    [128.63, 233.06],
+                ]
+            )
+            pmt_matrix = np.array(
+                [
+                    np.sin(np.deg2rad(pmt_angles[:, 0]))
+                    * np.cos(np.deg2rad(pmt_angles[:, 1])),
+                    np.sin(np.deg2rad(pmt_angles[:, 0]))
+                    * np.sin(np.deg2rad(pmt_angles[:, 1])),
+                    np.cos(np.deg2rad(pmt_angles[:, 0])),
+                ]
+            ).T
+        else:
+            raise ValueError(
+                "Unsupported pone_offline_version: "
+                f"{pone_offline_version}. Expected 'v2' or 'v3'."
+            )
 
-        # rotate from POM frame back to world frame (inverse of R_x(+90°) used in POMModel)
-        r_x_minus_90 = np.array(
-            [[1., 0.,  0.],
-             [0., 0.,  1.],
-             [0., -1., 0.]],
-            dtype=float,
-        )
-
-        self._PMT_COORDINATES_ORIGINAL = (pmt_matrix_pom_frame * module_radius_m) @ r_x_minus_90.T
+        self._PMT_COORDINATES_ORIGINAL = pmt_matrix * module_radius_m
 
     def set_gcd(self, gcd_file: Optional[str] = None) -> None:
         """Extract GFrame from gcd-file.

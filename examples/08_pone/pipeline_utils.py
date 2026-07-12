@@ -70,9 +70,16 @@ def resolve_classification_paths(cfg: dict) -> Tuple[Dict[str, dict], str]:
     percentiles_csv = cfg["data"].get("percentiles_csv")
     if not percentiles_csv:
         robust_scaler = getattr(mod, "ROBUST_SCALER")
-        percentiles_csv = robust_scaler.get(mc, {}).get(geometry, {}).get("mixed")
+        percentiles_csv = (
+            robust_scaler.get(mc, {})
+            .get(geometry, {})
+            .get("classification")
+        )
     if not percentiles_csv:
-        raise ValueError(f"ROBUST_SCALER['{mc}']['{geometry}']['mixed'] is missing in paths.py.")
+        raise ValueError(
+            f"ROBUST_SCALER['{mc}']['{geometry}']['classification'] "
+            "is missing in paths.py."
+        )
     print(f"[Paths] percentiles_csv: {percentiles_csv}")
 
     return per_flavor, percentiles_csv

@@ -52,9 +52,10 @@ data:
     - zenith
     - azimuth
     - pid
-    - interaction_type
-    - category1
-    - category2
+    - is_CC
+    - category1_isMuonCC
+    - category2_tauCC_others_muonCC
+    - category_3_contains_muon
 
   # If null, paths.py resolves ROBUST_SCALER[mc][geometry][<routing>_mixed_<class>].
   percentiles_csv: null

@@ -1,4 +1,4 @@
-experiment_name: exp003
+experiment_name: baseline
 
 # Reconstruction trains one separate model per routing class and target.
 # The submit wrapper expands routing.classes x task.targets into separate
@@ -11,12 +11,12 @@ task:
 # Dataset family and detector geometry. Paths are resolved through:
 #   /project/def-nahee/kbas/Graphnet-Applications/Metadata/paths.py
 mc: 340StringMC
-geometry: full_geometry_emax1e6
+geometry: 102_string_emax1e6
 
 # Reconstruction is trained after classification routing. For every selected
 # class under this category, all available flavor paths are mixed for train/val.
 routing:
-  category: first_category
+  category: category1_isMuonCC
   classes: all
 
 output:
@@ -52,11 +52,12 @@ data:
     - zenith
     - azimuth
     - pid
-    - interaction_type
-    - category1
-    - category2
+    - is_CC
+    - category1_isMuonCC
+    - category2_tauCC_others_muonCC
+    - category_3_contains_muon
 
-  # If null, paths.py resolves ROBUST_SCALER[mc][geometry][<routing>_mixed_<class>].
+  # If null, paths.py resolves ROBUST_SCALER[mc][geometry]["reconstruction"][routing.category][route_class].
   percentiles_csv: null
 
 weights:
@@ -71,7 +72,7 @@ training:
   seed: 20260202
   max_epochs: 30
   early_stopping_patience: 5
-  batch_size: 512
+  batch_size: 256
   accumulate_grad_batches: 4
   base_lr: 1.0e-5
   peak_lr: 2.0e-3

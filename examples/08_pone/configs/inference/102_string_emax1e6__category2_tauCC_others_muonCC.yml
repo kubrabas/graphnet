@@ -1,0 +1,93 @@
+experiment_name: baseline
+
+task:
+  type: inference
+  mode: routed
+
+mc: 340StringMC
+geometry: 102_string_emax1e6
+flavors: [Muon, Electron, Tau, NC]
+
+routing:
+  category: category2_tauCC_others_muonCC
+  classes: [0, 1, 2]
+
+classification:
+  config: /project/def-nahee/kbas/graphnet/examples/08_pone/configs/classification/102_string_emax1e6__category2_tauCC_others_muonCC.yml
+  experiment_name: baseline
+  # Binary modes use this probability cut; multiclass uses argmax.
+  threshold: null
+  positive_label: 2
+
+reconstruction:
+  config: /project/def-nahee/kbas/graphnet/examples/08_pone/configs/reconstruction/102_string_emax1e6__category2_tauCC_others_muonCC.yml
+  experiment_name: baseline
+  targets: [energy, zenith, azimuth]
+
+output:
+  root_dir: /project/def-nahee/kbas/Graphnet-Applications/Results
+  dirs:
+    inference: inference
+
+run:
+  existing_output: error
+
+data:
+  split: test
+  pulsemaps: features
+  truth_table: truth
+  features: [pmt_x, pmt_y, pmt_z, dom_time, charge]
+  truth_all:
+    - event_no
+    - RunID
+    - SubrunID
+    - EventID
+    - SubEventID
+    - category1_isMuonCC
+    - category2_tauCC_others_muonCC
+    - category_3_contains_muon
+    - position_x
+    - position_y
+    - position_z
+    - pid
+    - is_CC
+    - totalEnergy
+    - zenith
+    - azimuth
+    - finalStateX
+    - finalStateY
+    - finalType1
+    - finalType2
+    - initialType
+    - totalColumnDepth
+    - impactParameter
+    - fully_contained
+    - starting_track
+    - stopping_track
+    - through_going
+    - missed_track
+  # null resolves classification and route-specific reconstruction scalers
+  # through Metadata/paths.py ROBUST_SCALER.
+  percentiles_csv: null
+
+inference:
+  batch_size: 256
+  num_workers: 8
+  multiprocessing_context: spawn
+  pin_memory: true
+
+notebook:
+  enabled: true
+  template: /project/def-nahee/kbas/graphnet/examples/08_pone/inference_scripts/inference_report_template.ipynb
+  output_name: inference_report.ipynb
+  timeout_seconds: 3600
+  allow_failure: true
+  command: jupyter
+
+slurm:
+  account: def-nahee
+  time: "08:00:00"
+  mem: 96G
+  cpus_per_task: 8
+  gpus_per_node: nvidia_h100_80gb_hbm3_3g.40gb:1
+  exclude: fc10713
