@@ -1,0 +1,641 @@
+#!/usr/bin/env python3
+"""Run adaptive Optuna studies by orchestrating existing SLURM workers.
+
+Optuna itself runs only in this CPU controller. Each trial gets an isolated
+copy of the production YAML config and is submitted through the existing
+classification or reconstruction submitter.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+import json
+import math
+import re
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import optuna
+import yaml
+from optuna.trial import TrialState
+
+
+CLASSIFICATION_SUBMITTER = Path(
+    "/home/kbas/SlurmScripts/GraphNet/submit_classification_pipeline.py"
+)
+RECONSTRUCTION_SUBMITTER = Path(
+    "/home/kbas/SlurmScripts/GraphNet/submit_reconstruction_pipeline.py"
+)
+FINISH_MARKERS = {
+    "classification": re.compile(r"--- train_classification finished \(rc=(\d+)\)"),
+    "reconstruction": re.compile(r"--- train_reconstruction finished \(rc=(\d+)\)"),
+}
+TERMINAL_SLURM_STATES = {
+    "BOOT_FAIL",
+    "CANCELLED",
+    "COMPLETED",
+    "DEADLINE",
+    "FAILED",
+    "NODE_FAIL",
+    "OUT_OF_MEMORY",
+    "PREEMPTED",
+    "REVOKED",
+    "TIMEOUT",
+}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def atomic_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
+def load_yaml(path: Path) -> dict:
+    with path.open() as handle:
+        payload = yaml.safe_load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected a YAML mapping: {path}")
+    return payload
+
+
+def deep_update(base: dict, updates: dict) -> dict:
+    result = copy.deepcopy(base)
+    for key, value in (updates or {}).items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_update(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def validate_study_config(cfg: dict) -> None:
+    required = [
+        "study_name",
+        "campaign_dir",
+        "task_type",
+        "base_config",
+        "n_trials",
+        "max_parallel_gpu_jobs",
+        "search_space",
+    ]
+    missing = [key for key in required if key not in cfg]
+    if missing:
+        raise ValueError(f"Missing study config keys: {missing}")
+
+    if cfg["task_type"] not in {"classification", "reconstruction"}:
+        raise ValueError("task_type must be classification or reconstruction")
+    if int(cfg["n_trials"]) < 1:
+        raise ValueError("n_trials must be positive")
+    if int(cfg.get("max_failed_trials", 0)) < 0:
+        raise ValueError("max_failed_trials cannot be negative")
+    if cfg.get("replace_failed_trials", False) and "max_failed_trials" not in cfg:
+        raise ValueError("replace_failed_trials requires max_failed_trials")
+    if int(cfg["max_parallel_gpu_jobs"]) < 1:
+        raise ValueError("max_parallel_gpu_jobs must be positive")
+    if cfg["task_type"] == "reconstruction":
+        if not cfg.get("target"):
+            raise ValueError("Reconstruction studies require target")
+        if not cfg.get("route_classes"):
+            raise ValueError("Reconstruction studies require route_classes")
+        if int(cfg["max_parallel_gpu_jobs"]) < len(cfg["route_classes"]):
+            raise ValueError(
+                "max_parallel_gpu_jobs must fit at least one complete route-class bundle"
+            )
+
+    base_path = Path(cfg["base_config"]).resolve()
+    if not base_path.is_file():
+        raise FileNotFoundError(base_path)
+    base = load_yaml(base_path)
+    if base.get("task", {}).get("type") != cfg["task_type"]:
+        raise ValueError("base_config task.type does not match task_type")
+
+
+def suggest_parameters(trial: optuna.Trial, search_space: dict) -> dict:
+    params: Dict[str, Any] = {}
+    for name, spec in search_space.items():
+        kind = spec["type"]
+        if kind == "float":
+            params[name] = trial.suggest_float(
+                name,
+                float(spec["low"]),
+                float(spec["high"]),
+                log=bool(spec.get("log", False)),
+                step=spec.get("step"),
+            )
+        elif kind == "int":
+            params[name] = trial.suggest_int(
+                name,
+                int(spec["low"]),
+                int(spec["high"]),
+                step=int(spec.get("step", 1)),
+                log=bool(spec.get("log", False)),
+            )
+        elif kind == "categorical":
+            params[name] = trial.suggest_categorical(name, list(spec["choices"]))
+        else:
+            raise ValueError(f"Unsupported search-space type for {name}: {kind}")
+    return params
+
+
+def apply_trial_parameters(config: dict, params: dict) -> dict:
+    result = copy.deepcopy(config)
+    supported = {"peak_lr", "base_lr", "nb_neighbours"}
+    unknown = set(params) - supported
+    if unknown:
+        raise ValueError(f"No config mapping for parameters: {sorted(unknown)}")
+    for name in ("peak_lr", "base_lr"):
+        if name in params:
+            result["training"][name] = params[name]
+    if "nb_neighbours" in params:
+        result["model"]["nb_neighbours"] = params["nb_neighbours"]
+    return result
+
+
+def build_trial_config(study_cfg: dict, trial_number: int, params: dict) -> Tuple[dict, Path]:
+    base = load_yaml(Path(study_cfg["base_config"]).resolve())
+    trial_name = f"trial_{trial_number:04d}"
+    campaign_dir = Path(study_cfg["campaign_dir"]).resolve()
+
+    config = deep_update(base, study_cfg.get("fixed_overrides", {}))
+    config = apply_trial_parameters(config, params)
+    config["experiment_name"] = trial_name
+    config["output"]["root_dir"] = str(campaign_dir / "model_outputs")
+    config.setdefault("run", {})["existing_output"] = "error"
+
+    if study_cfg["task_type"] == "reconstruction":
+        config["task"]["targets"] = [str(study_cfg["target"])]
+        config["routing"]["classes"] = [str(value) for value in study_cfg["route_classes"]]
+        # A trial trains one target, so the sampled settings can live directly
+        # in training/model without relying on target_overrides.
+        config.setdefault("target_overrides", {})["enabled"] = False
+
+    trial_dir = campaign_dir / "trials" / trial_name
+    config_path = trial_dir / "config.yml"
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    with config_path.open("w") as handle:
+        yaml.safe_dump(config, handle, sort_keys=False)
+    return config, config_path
+
+
+def expected_jobs(study_cfg: dict) -> int:
+    return (
+        len(study_cfg["route_classes"])
+        if study_cfg["task_type"] == "reconstruction"
+        else 1
+    )
+
+
+def parse_submission(task_type: str, stdout: str) -> List[dict]:
+    if task_type == "classification":
+        log_match = re.search(r"^train logfile\s*:\s*(.+)$", stdout, re.MULTILINE)
+        job_match = re.search(r"^submitted train job:\s*(\d+)$", stdout, re.MULTILINE)
+        if not log_match or not job_match:
+            raise RuntimeError(f"Could not parse classification submission:\n{stdout}")
+        return [
+            {
+                "key": "classification",
+                "job_id": job_match.group(1),
+                "logfile": log_match.group(1).strip(),
+                "status": "SUBMITTED",
+            }
+        ]
+
+    log_paths = {
+        (route_class, target): path.strip()
+        for route_class, target, path in re.findall(
+            r"^\[class([^ ]+) ([^\]]+)\] logfile\s*:\s*(.+)$",
+            stdout,
+            re.MULTILINE,
+        )
+    }
+    job_ids = {
+        (route_class, target): job_id
+        for route_class, target, job_id in re.findall(
+            r"^\s+class([^ ]+) ([^:]+):\s*(\d+)\s*$",
+            stdout,
+            re.MULTILINE,
+        )
+    }
+    if not job_ids or set(job_ids) != set(log_paths):
+        raise RuntimeError(f"Could not parse reconstruction submission:\n{stdout}")
+    return [
+        {
+            "key": f"class{route_class}_{target}",
+            "route_class": route_class,
+            "target": target,
+            "job_id": job_ids[(route_class, target)],
+            "logfile": log_paths[(route_class, target)],
+            "status": "SUBMITTED",
+        }
+        for route_class, target in sorted(job_ids)
+    ]
+
+
+def submit_trial(study_cfg: dict, config_path: Path) -> Tuple[List[dict], str]:
+    submitter = (
+        RECONSTRUCTION_SUBMITTER
+        if study_cfg["task_type"] == "reconstruction"
+        else CLASSIFICATION_SUBMITTER
+    )
+    result = subprocess.run(
+        ["python3", str(submitter), "--config", str(config_path)],
+        text=True,
+        capture_output=True,
+    )
+    combined = result.stdout + ("\n" + result.stderr if result.stderr else "")
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Submitter failed with rc={result.returncode}:\n{combined}"
+        )
+    return parse_submission(study_cfg["task_type"], result.stdout), combined
+
+
+def last_finish_code(logfile: Path, task_type: str) -> Optional[int]:
+    if not logfile.is_file():
+        return None
+    matches = FINISH_MARKERS[task_type].findall(
+        logfile.read_text(errors="replace")
+    )
+    return int(matches[-1]) if matches else None
+
+
+def slurm_state(job_id: str) -> Optional[str]:
+    queued = subprocess.run(
+        ["squeue", "-h", "-j", str(job_id), "-o", "%T"],
+        text=True,
+        capture_output=True,
+    )
+    states = [line.strip().upper() for line in queued.stdout.splitlines() if line.strip()]
+    if states:
+        return states[0]
+
+    accounted = subprocess.run(
+        ["sacct", "-n", "-X", "-j", str(job_id), "-o", "State", "-P"],
+        text=True,
+        capture_output=True,
+    )
+    for line in accounted.stdout.splitlines():
+        value = line.strip().split("|", 1)[0].split("+", 1)[0].upper()
+        if value:
+            return value
+    return None
+
+
+def update_job_status(job: dict, task_type: str) -> None:
+    finish_code = last_finish_code(Path(job["logfile"]), task_type)
+    if finish_code is not None:
+        job["status"] = "COMPLETED" if finish_code == 0 else "FAILED"
+        job["return_code"] = finish_code
+        job["updated_at"] = utc_now()
+        return
+
+    state = slurm_state(job["job_id"])
+    job["slurm_state"] = state
+    job["updated_at"] = utc_now()
+    if state in TERMINAL_SLURM_STATES and state != "COMPLETED":
+        job["status"] = "FAILED"
+        job["failure_reason"] = f"SLURM state {state} without rc=0 marker"
+    elif state == "COMPLETED":
+        first_seen = job.setdefault("completed_without_marker_at", time.time())
+        if time.time() - float(first_seen) > 300:
+            job["status"] = "FAILED"
+            job["failure_reason"] = "SLURM completed but rc marker was not written"
+    else:
+        job["status"] = state or "UNKNOWN"
+
+
+def cancel_unfinished_siblings(jobs: Iterable[dict], failed_job: dict) -> None:
+    """Stop workers whose shared trial can no longer produce an objective."""
+    for job in jobs:
+        if job is failed_job or job.get("status") in {"COMPLETED", "FAILED"}:
+            continue
+        result = subprocess.run(
+            ["scancel", str(job["job_id"])],
+            text=True,
+            capture_output=True,
+        )
+        job["updated_at"] = utc_now()
+        if result.returncode == 0:
+            job["status"] = "CANCELLED"
+            job["cancellation_reason"] = (
+                f"Sibling worker {failed_job['job_id']} failed"
+            )
+        else:
+            job["cancellation_error"] = (
+                result.stderr.strip() or result.stdout.strip()
+            )
+
+
+def best_validation_loss(history_path: Path) -> float:
+    with history_path.open(newline="") as handle:
+        values = [
+            float(row["val_loss"])
+            for row in csv.DictReader(handle)
+            if row.get("val_loss") not in (None, "")
+            and math.isfinite(float(row["val_loss"]))
+        ]
+    if not values:
+        raise ValueError(f"No finite val_loss values: {history_path}")
+    return min(values)
+
+
+def validation_rows(predictions_path: Path) -> int:
+    with predictions_path.open(newline="") as handle:
+        return max(sum(1 for _ in handle) - 1, 0)
+
+
+def objective_from_jobs(jobs: Iterable[dict]) -> Tuple[float, List[dict]]:
+    components = []
+    for job in jobs:
+        output_dir = Path(job["logfile"]).parent
+        loss = best_validation_loss(output_dir / "training_history_by_epoch.csv")
+        count = validation_rows(output_dir / "validation_predictions.csv")
+        if count <= 0:
+            raise ValueError(f"No validation rows for {job['key']}: {output_dir}")
+        components.append(
+            {"key": job["key"], "best_val_loss": loss, "validation_rows": count}
+        )
+    total = sum(item["validation_rows"] for item in components)
+    objective = sum(
+        item["best_val_loss"] * item["validation_rows"] for item in components
+    ) / total
+    return objective, components
+
+
+def manifest_path(campaign_dir: Path, trial_number: int) -> Path:
+    return campaign_dir / "trials" / f"trial_{trial_number:04d}" / "manifest.json"
+
+
+def load_manifests(campaign_dir: Path) -> Dict[int, dict]:
+    manifests: Dict[int, dict] = {}
+    for path in sorted((campaign_dir / "trials").glob("trial_*/manifest.json")):
+        payload = json.loads(path.read_text())
+        manifests[int(payload["trial_number"])] = payload
+    return manifests
+
+
+def refresh_summary(study: optuna.Study, campaign_dir: Path) -> None:
+    rows = []
+    param_names = sorted({name for trial in study.trials for name in trial.params})
+    for trial in study.trials:
+        row = {
+            "trial": trial.number,
+            "state": trial.state.name,
+            "objective": trial.value,
+            **{name: trial.params.get(name) for name in param_names},
+        }
+        rows.append(row)
+    path = campaign_dir / "trials_summary.csv"
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["trial", "state", "objective", *param_names],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    complete = [trial for trial in study.trials if trial.state == TrialState.COMPLETE]
+    if complete:
+        best = study.best_trial
+        atomic_json(
+            campaign_dir / "best_trial.json",
+            {
+                "trial": best.number,
+                "objective": best.value,
+                "params": best.params,
+                "updated_at": utc_now(),
+            },
+        )
+
+
+def create_or_load_study(study_cfg: dict) -> optuna.Study:
+    campaign_dir = Path(study_cfg["campaign_dir"]).resolve()
+    storage = f"sqlite:///{campaign_dir / 'optuna.db'}"
+    sampler_cfg = study_cfg.get("sampler", {})
+    sampler_seed = int(sampler_cfg.get("seed", 20260714))
+
+    def make_sampler(seed_offset: int = 0) -> optuna.samplers.TPESampler:
+        return optuna.samplers.TPESampler(
+            seed=sampler_seed + seed_offset,
+            n_startup_trials=int(sampler_cfg.get("n_startup_trials", 4)),
+            multivariate=bool(sampler_cfg.get("multivariate", True)),
+        )
+
+    study = optuna.create_study(
+        study_name=study_cfg["study_name"],
+        storage=storage,
+        load_if_exists=True,
+        direction="minimize",
+        sampler=make_sampler(),
+    )
+    if study.trials:
+        study = optuna.load_study(
+            study_name=study_cfg["study_name"],
+            storage=storage,
+            sampler=make_sampler(len(study.trials)),
+        )
+    return study
+
+
+def trial_budget(study_cfg: dict) -> Tuple[int, int, bool]:
+    target_complete = int(study_cfg["n_trials"])
+    replace_failed = bool(study_cfg.get("replace_failed_trials", False))
+    max_failed = int(study_cfg.get("max_failed_trials", 0))
+    attempt_limit = target_complete + max_failed if replace_failed else target_complete
+    return target_complete, attempt_limit, replace_failed
+
+
+def trial_state_counts(study: optuna.Study) -> Tuple[int, int]:
+    complete = sum(trial.state == TrialState.COMPLETE for trial in study.trials)
+    running = sum(trial.state == TrialState.RUNNING for trial in study.trials)
+    return complete, running
+
+
+def preflight(study_cfg: dict) -> None:
+    validate_study_config(study_cfg)
+    base = load_yaml(Path(study_cfg["base_config"]).resolve())
+    target_complete, attempt_limit, replace_failed = trial_budget(study_cfg)
+    print("preflight: passed")
+    print(f"study: {study_cfg['study_name']}")
+    print(f"task: {study_cfg['task_type']}")
+    print(f"base geometry: {base['geometry']}")
+    print(f"target complete trials: {target_complete}")
+    print(f"trial attempt limit: {attempt_limit}")
+    print(f"replace failed trials: {replace_failed}")
+    print(f"jobs per trial: {expected_jobs(study_cfg)}")
+    print(f"GPU job cap: {study_cfg['max_parallel_gpu_jobs']}")
+    print(f"campaign: {Path(study_cfg['campaign_dir']).resolve()}")
+
+
+def run(study_cfg: dict) -> None:
+    validate_study_config(study_cfg)
+    campaign_dir = Path(study_cfg["campaign_dir"]).resolve()
+    campaign_dir.mkdir(parents=True, exist_ok=True)
+    study = create_or_load_study(study_cfg)
+    poll_seconds = int(study_cfg.get("poll_seconds", 60))
+    target_complete, attempt_limit, replace_failed = trial_budget(study_cfg)
+    gpu_cap = int(study_cfg["max_parallel_gpu_jobs"])
+    bundle_size = expected_jobs(study_cfg)
+
+    print(f"[{utc_now()}] controller started: {study.study_name}", flush=True)
+    while True:
+        manifests = load_manifests(campaign_dir)
+        running_trials = [
+            trial for trial in study.trials if trial.state == TrialState.RUNNING
+        ]
+
+        for frozen in running_trials:
+            manifest = manifests.get(frozen.number)
+            if manifest is None:
+                print(
+                    f"trial {frozen.number}: missing manifest; marking failed",
+                    flush=True,
+                )
+                study.tell(frozen.number, state=TrialState.FAIL)
+                continue
+            for job in manifest.get("jobs", []):
+                if job.get("status") not in {"COMPLETED", "FAILED"}:
+                    update_job_status(job, study_cfg["task_type"])
+
+            jobs = manifest.get("jobs", [])
+            failed_job = next(
+                (job for job in jobs if job.get("status") == "FAILED"), None
+            )
+            if failed_job is not None:
+                cancel_unfinished_siblings(jobs, failed_job)
+                manifest["state"] = "FAILED"
+                manifest["finished_at"] = utc_now()
+                atomic_json(manifest_path(campaign_dir, frozen.number), manifest)
+                study.tell(frozen.number, state=TrialState.FAIL)
+                print(f"trial {frozen.number}: failed", flush=True)
+            elif len(jobs) == bundle_size and all(
+                job.get("status") == "COMPLETED" for job in jobs
+            ):
+                try:
+                    objective, components = objective_from_jobs(jobs)
+                except Exception as exc:  # preserve diagnostics in manifest
+                    manifest["state"] = "FAILED"
+                    manifest["failure_reason"] = repr(exc)
+                    manifest["finished_at"] = utc_now()
+                    atomic_json(manifest_path(campaign_dir, frozen.number), manifest)
+                    study.tell(frozen.number, state=TrialState.FAIL)
+                    print(f"trial {frozen.number}: objective failed: {exc}", flush=True)
+                else:
+                    manifest["state"] = "COMPLETE"
+                    manifest["objective"] = objective
+                    manifest["objective_components"] = components
+                    manifest["finished_at"] = utc_now()
+                    atomic_json(manifest_path(campaign_dir, frozen.number), manifest)
+                    study.tell(frozen.number, objective)
+                    print(
+                        f"trial {frozen.number}: complete objective={objective:.8g}",
+                        flush=True,
+                    )
+            else:
+                manifest["state"] = "RUNNING"
+                atomic_json(manifest_path(campaign_dir, frozen.number), manifest)
+
+        refresh_summary(study, campaign_dir)
+        complete_count, running_count = trial_state_counts(study)
+        if replace_failed:
+            if complete_count >= target_complete and running_count == 0:
+                print(
+                    f"[{utc_now()}] study finished: "
+                    f"complete={complete_count} attempts={len(study.trials)}",
+                    flush=True,
+                )
+                return
+            if len(study.trials) >= attempt_limit and running_count == 0:
+                print(
+                    f"[{utc_now()}] study stopped at attempt limit: "
+                    f"complete={complete_count}/{target_complete} "
+                    f"attempts={len(study.trials)}/{attempt_limit}",
+                    flush=True,
+                )
+                return
+        elif len(study.trials) >= target_complete and running_count == 0:
+            print(f"[{utc_now()}] study finished", flush=True)
+            return
+
+        manifests = load_manifests(campaign_dir)
+        active_jobs = sum(
+            1
+            for manifest in manifests.values()
+            if manifest.get("state") in {"SUBMITTING", "RUNNING"}
+            for job in manifest.get("jobs", [])
+            if job.get("status") not in {"COMPLETED", "FAILED"}
+        )
+
+        complete_or_running = complete_count + running_count
+        while (
+            len(study.trials) < attempt_limit
+            and (not replace_failed or complete_or_running < target_complete)
+            and active_jobs + bundle_size <= gpu_cap
+        ):
+            trial = study.ask()
+            params = suggest_parameters(trial, study_cfg["search_space"])
+            _, config_path = build_trial_config(
+                study_cfg, trial.number, params
+            )
+            manifest = {
+                "trial_number": trial.number,
+                "state": "SUBMITTING",
+                "params": params,
+                "config": str(config_path),
+                "jobs": [],
+                "created_at": utc_now(),
+            }
+            path = manifest_path(campaign_dir, trial.number)
+            atomic_json(path, manifest)
+            try:
+                jobs, submit_output = submit_trial(study_cfg, config_path)
+            except Exception as exc:
+                manifest["state"] = "FAILED"
+                manifest["failure_reason"] = repr(exc)
+                manifest["finished_at"] = utc_now()
+                atomic_json(path, manifest)
+                study.tell(trial.number, state=TrialState.FAIL)
+                print(f"trial {trial.number}: submission failed: {exc}", flush=True)
+                break
+
+            (path.parent / "submission.out").write_text(submit_output)
+            manifest["state"] = "RUNNING"
+            manifest["jobs"] = jobs
+            manifest["submitted_at"] = utc_now()
+            atomic_json(path, manifest)
+            active_jobs += len(jobs)
+            complete_or_running += 1
+            print(
+                f"trial {trial.number}: submitted {len(jobs)} jobs params={params}",
+                flush=True,
+            )
+
+        refresh_summary(study, campaign_dir)
+        time.sleep(poll_seconds)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--preflight", action="store_true")
+    args = parser.parse_args()
+    study_cfg = load_yaml(args.config.resolve())
+    if args.preflight:
+        preflight(study_cfg)
+    else:
+        run(study_cfg)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

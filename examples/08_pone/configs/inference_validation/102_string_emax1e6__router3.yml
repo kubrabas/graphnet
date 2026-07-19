@@ -1,0 +1,23 @@
+task:
+  type: inference_validation
+
+mc: 340StringMC
+geometry: 102_string_emax1e6
+router_name: router3
+
+base_inference_config: /project/def-nahee/kbas/graphnet/examples/08_pone/configs/inference/102_string_emax1e6__category_3_contains_muon.yml
+
+output:
+  root_dir: /project/def-nahee/kbas/Graphnet-Applications/Results
+  filename: router3_predictions.csv
+
+run:
+  existing_output: error
+
+slurm:
+  account: def-nahee
+  time: "01:00:00"
+  mem: 96G
+  cpus_per_task: 8
+  gpus_per_node: nvidia_h100_80gb_hbm3_3g.40gb:1
+  exclude: fc10713
