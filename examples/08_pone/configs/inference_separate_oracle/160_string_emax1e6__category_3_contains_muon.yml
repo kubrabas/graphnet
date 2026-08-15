@@ -1,4 +1,4 @@
-experiment_name: baseline
+experiment_name: baseline_separate_direction
 
 task:
   type: inference

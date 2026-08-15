@@ -34,7 +34,7 @@ def load_yaml(path: str | Path) -> dict:
         return yaml.safe_load(f)
 
 
-def validation_config(cfg: dict) -> tuple[dict, dict, dict]:
+def validation_config(cfg: dict) -> tuple[dict, dict, dict, dict | None]:
     base_path = Path(cfg["base_inference_config"]).expanduser().resolve()
     base_cfg = load_yaml(base_path)
     base_cfg["data"]["split"] = "val"
@@ -42,8 +42,10 @@ def validation_config(cfg: dict) -> tuple[dict, dict, dict]:
 
     cls_cfg = load_yaml(base_cfg["classification"]["config"])
     reco_cfg = load_yaml(base_cfg["reconstruction"]["config"])
-    inference.validate_config(base_cfg, cls_cfg, reco_cfg)
-    return base_cfg, cls_cfg, reco_cfg
+    joint_path = (base_cfg.get("joint_direction", {}) or {}).get("config")
+    joint_cfg = load_yaml(joint_path) if joint_path else None
+    inference.validate_config(base_cfg, cls_cfg, reco_cfg, joint_cfg)
+    return base_cfg, cls_cfg, reco_cfg, joint_cfg
 
 
 def output_path(cfg: dict) -> Path:
@@ -190,11 +192,12 @@ def main() -> int:
     if cfg["task"]["type"] != "inference_validation":
         raise ValueError("Expected task.type=inference_validation")
 
-    base_cfg, cls_cfg, reco_cfg = validation_config(cfg)
+    base_cfg, cls_cfg, reco_cfg, joint_cfg = validation_config(cfg)
     if cfg["mc"] != base_cfg["mc"] or cfg["geometry"] != base_cfg["geometry"]:
         raise ValueError("Validation and base inference configs must use the same mc/geometry")
 
-    inference.preflight(base_cfg, cls_cfg, reco_cfg)
+    inference.preflight(base_cfg, cls_cfg, reco_cfg, joint_cfg)
+    inference.require_cuda(base_cfg)
     destination = output_path(cfg)
     if os.environ.get("OUTPUT_PREPARED", "0") != "1":
         handle_existing_output(
@@ -209,26 +212,8 @@ def main() -> int:
 
     paths = inference.resolve_mixed_split_paths(base_cfg)
     cls_df = inference.run_classification(base_cfg, cls_cfg, paths)
-    routed_reco = inference.run_reconstruction(base_cfg, reco_cfg, paths, cls_df)
-
-    oracle_assignment = cls_df.copy()
-    oracle_assignment["predicted_route_class"] = oracle_assignment[
-        "true_classification_class"
-    ].astype(int)
-    expected_classes = {str(route_class) for route_class in base_cfg["routing"]["classes"]}
-    assigned_classes = set(
-        oracle_assignment["predicted_route_class"].astype(str).unique()
-    )
-    if not assigned_classes.issubset(expected_classes):
-        raise ValueError(
-            "Truth route classes are not present in the configured route classes: "
-            f"{sorted(assigned_classes - expected_classes)}"
-        )
-    oracle_reco = inference.run_reconstruction(
-        base_cfg,
-        reco_cfg,
-        paths,
-        oracle_assignment,
+    routed_reco, oracle_reco = inference.run_reconstruction(
+        base_cfg, reco_cfg, joint_cfg, paths, cls_df
     )
 
     output = comparison_frame(

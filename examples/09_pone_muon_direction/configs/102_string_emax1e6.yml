@@ -1,0 +1,120 @@
+# First evidence-based pilot: no router, Muon CC only, one joint 3D direction.
+experiment_name: joint_weighted_alpha05_v1
+
+run:
+  # Existing results are never deleted by this pipeline.
+  existing_output: error  # error | resume
+
+output:
+  root_dir: /project/def-nahee/kbas/Graphnet-Applications/Results/340StringMC_JointDirection
+
+environment:
+  # The container supplies CUDA/PyTorch dependencies. This local checkout must
+  # be the GraphNeT package that Python actually imports.
+  graphnet_source: /project/def-nahee/kbas/graphnet/src
+  container_image: docker://rorsoe/graphnet:graphnet-1.8.0-cu126-torch26-ubuntu-22.04
+
+data:
+  geometry: 102_string_emax1e6
+  flavor: Muon
+  parquet_table: STRING340MC_PARQUET
+  paths_py: /project/def-nahee/kbas/Graphnet-Applications/Metadata/paths.py
+  percentiles_csv: /project/def-nahee/kbas/Graphnet-Applications/Metadata/RobustScaler/340StringMC/mixed/102_string_emax1e6/category1_isMuonCC/class_1_muon_cc/train_feature_percentiles_p25_p50_p75.csv
+  pulsemaps: features
+  truth_table: truth
+  features: [pmt_x, pmt_y, pmt_z, dom_time, charge]
+  physical_event_id_columns: [RunID, SubrunID, EventID, SubEventID]
+  trigger_column: triggered_nonoise_102_string
+  parquet_cache_size: 1
+
+# Fit only on train truth. Parquet files are read-only and never gain a column.
+weighting:
+  alpha: 0.5
+  clip_min: 0.2
+  clip_max: 5.0
+  out_of_range: error
+  log10_energy_bin_edges: [2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 3.0, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 4.0, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.9, 5.0, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 5.8, 5.9, 6.0]
+
+loss:
+  # Stage B is opening angle [radian] + 0.05 * vMF, as agreed.
+  angular_surrogate: opening_angle
+  vmf_factor: 0.05
+
+metrics:
+  # Wider than weight bins so median/q68 are stable and readable.
+  log10_energy_bin_edges: [2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0]
+  minimum_events_per_bin: 100
+
+loader:
+  batch_size: 256
+  accumulate_grad_batches: 4
+  num_workers: 8
+  multiprocessing_context: spawn
+  pin_memory: true
+
+training:
+  seed: 20260202
+  stage_a:
+    objective: vmf
+    max_epochs: 3
+    base_lr: 1.0e-5
+    peak_lr: 2.0e-3
+    warmup_fraction: 0.5
+    early_stopping: false
+    early_stopping_patience: 3
+    early_stopping_min_delta: 0.001
+  stage_b:
+    objective: angular_hybrid
+    max_epochs: 30
+    base_lr: 1.0e-6
+    peak_lr: 2.0e-4
+    warmup_fraction: 0.5
+    early_stopping: true
+    early_stopping_patience: 7
+    early_stopping_min_delta: 0.001
+
+model:
+  name: dynedge
+  nb_neighbours: 8
+  global_pooling_schemes: [min, max, mean, sum]
+  add_global_variables_after_pooling: true
+  add_norm_layer: false
+  skip_readout: false
+  activation_layer: null
+  # Null preserves the current GraphNeT DynEdge baseline. These are explicit
+  # knobs for a later depth ablation after the joint baseline is measured.
+  dynedge_layer_sizes: null
+  post_processing_layer_sizes: null
+  readout_layer_sizes: null
+
+checkpointing:
+  primary_monitor: val_macro_median_deg
+  monitors:
+    best_macro_median: val_macro_median_deg
+    best_global_median: val_global_median_deg
+    best_global_q68: val_global_q68_deg
+    best_weighted_objective: val_objective_loss_weighted
+  save_every_epoch: false
+
+trainer:
+  accelerator: gpu
+  devices: 1
+  require_gpu: true
+  precision: 32-true
+  float32_matmul_precision: high
+  gradient_clip_val: 0.0
+  num_sanity_val_steps: 2
+  deterministic: false
+  progress_bar: false
+  model_summary: true
+  log_every_n_steps: 50
+
+slurm:
+  account: def-nahee
+  time: "24:00:00"
+  mem: 64G
+  cpus_per_task: 8
+  gpus_per_node: nvidia_h100_80gb_hbm3_3g.40gb:1
+  exclude: fc10713
+  inference_time: "08:00:00"
+  inference_mem: 96G

@@ -1,4 +1,4 @@
-experiment_name: baseline
+experiment_name: baseline_separate_direction
 
 task:
   type: inference
@@ -9,18 +9,18 @@ geometry: 160_string_emax1e6
 flavors: [Muon, Electron, Tau, NC]
 
 routing:
-  category: category_3_contains_muon
+  category: category1_isMuonCC
   classes: [0, 1]
 
 classification:
-  config: /project/def-nahee/kbas/graphnet/examples/08_pone/configs/classification/160_string_emax1e6__category_3_contains_muon.yml
+  config: /project/def-nahee/kbas/graphnet/examples/08_pone/configs/classification/160_string_emax1e6__category1_isMuonCC.yml
   experiment_name: baseline
   # Binary modes use this probability cut; multiclass uses argmax.
   threshold: 0.5
   positive_label: 1
 
 reconstruction:
-  config: /project/def-nahee/kbas/graphnet/examples/08_pone/configs/reconstruction/160_string_emax1e6__category_3_contains_muon.yml
+  config: /project/def-nahee/kbas/graphnet/examples/08_pone/configs/reconstruction/160_string_emax1e6__category1_isMuonCC.yml
   experiment_name: baseline
   targets: [energy, zenith, azimuth]
 

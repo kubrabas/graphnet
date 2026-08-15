@@ -1,4 +1,4 @@
-experiment_name: baseline
+experiment_name: baseline_joint_direction
 
 task:
   type: inference
@@ -22,7 +22,12 @@ classification:
 reconstruction:
   config: /project/def-nahee/kbas/graphnet/examples/08_pone/configs/reconstruction/160_string_emax1e6__category_3_contains_muon.yml
   experiment_name: baseline
-  targets: [energy, zenith, azimuth]
+  targets: [energy, zenith_azimuth]
+
+joint_direction:
+  config: /project/def-nahee/kbas/graphnet/examples/08_pone/configs/joint_direction/160_string_emax1e6__category_3_contains_muon.yml
+  stage: stage_b
+  checkpoint_name: best_macro_median
 
 output:
   root_dir: /project/def-nahee/kbas/Graphnet-Applications/Results

@@ -28,6 +28,8 @@ import yaml
 THIS_DIR = Path(__file__).resolve().parent
 PONE_DIR = THIS_DIR.parent
 TRAIN_DIR = PONE_DIR / "train_scripts"
+JOINT_DIR = PONE_DIR / "joint_direction"
+JOINT_REFERENCE_DIR = PONE_DIR.parent / "09_pone_muon_direction"
 for path in (PONE_DIR, TRAIN_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
@@ -43,6 +45,21 @@ from train_classification import build_model as build_classification_model
 from train_reconstruction import build_model as build_reconstruction_model
 from utils import _circular_signed_diff, _wrap_to_pi, extract_field, move_batch_to_device
 
+# The routed joint-direction implementation deliberately reuses the approved
+# model and coordinate transforms from example 09.
+for path in (JOINT_DIR, JOINT_REFERENCE_DIR):
+    if str(path) not in sys.path:
+        sys.path.append(str(path))
+
+from direction_utils import (
+    opening_angle_radians,
+    prediction_to_zenith_azimuth,
+    zenith_azimuth_to_unit_vector,
+)
+from energy_weighting import EnergyWeightManifest
+from model import build_joint_direction_model
+from routed_pipeline_utils import checkpoint_state
+
 
 ALL_FLAVORS = ["Muon", "Electron", "Tau", "NC"]
 EVENT_ID_FIELDS = ["event_no", "RunID", "SubrunID", "EventID", "SubEventID"]
@@ -51,6 +68,18 @@ EVENT_ID_FIELDS = ["event_no", "RunID", "SubrunID", "EventID", "SubEventID"]
 def load_yaml(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def require_cuda(cfg: dict) -> None:
+    """Refuse silent CPU fallback for production inference."""
+
+    require_gpu = bool(cfg.get("inference", {}).get("require_gpu", True))
+    if require_gpu and not torch.cuda.is_available():
+        raise RuntimeError(
+            "A CUDA GPU is required for inference, but torch.cuda.is_available() "
+            "is false. Refusing CPU fallback because it is much slower and can "
+            "change graph/KNN numerical results."
+        )
 
 
 def load_state_dict(model, checkpoint_path: str, label: str) -> None:
@@ -115,6 +144,45 @@ def resolve_reconstruction_checkpoint(
         / reco_cfg["output"]["dirs"]["train"]
         / target
         / "best_model.pth"
+    )
+
+
+def resolve_joint_direction_root(
+    cfg: dict, joint_cfg: dict, route_class: str
+) -> Path:
+    return (
+        Path(cfg["output"]["root_dir"])
+        / cfg["mc"]
+        / cfg["geometry"]
+        / "reconstruction"
+        / cfg["routing"]["category"]
+        / f"class{route_class}"
+        / cfg["reconstruction"].get("experiment_name", "baseline")
+        / joint_cfg["output"]["dirs"]["train"]
+        / "zenith_azimuth"
+    )
+
+
+def resolve_joint_direction_checkpoint(
+    cfg: dict, joint_cfg: dict, route_class: str
+) -> Path:
+    joint = cfg.get("joint_direction", {}) or {}
+    explicit = (joint.get("models", {}) or {}).get(str(route_class))
+    if explicit:
+        return Path(explicit)
+    stage = str(joint.get("stage", "stage_b"))
+    stage_dirs = {
+        "stage_a": "stage_a_vmf",
+        "stage_b": "stage_b_angular_hybrid",
+    }
+    if stage not in stage_dirs:
+        raise ValueError("joint_direction.stage must be stage_a or stage_b")
+    checkpoint_name = str(joint.get("checkpoint_name", "best_macro_median"))
+    return (
+        resolve_joint_direction_root(cfg, joint_cfg, route_class)
+        / stage_dirs[stage]
+        / "checkpoints"
+        / f"{checkpoint_name}.pth"
     )
 
 
@@ -318,6 +386,11 @@ def run_classification(cfg: dict, cls_cfg: dict, paths: Dict[str, str]) -> pd.Da
             rows.append(pd.DataFrame(row))
 
     df = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    if not df.empty:
+        df["true_route_class"] = df["true_classification_class"].astype(int)
+        df["router_correct"] = (
+            df["predicted_route_class"].astype(int) == df["true_route_class"]
+        )
     print(f"[Classification] rows={len(df)}")
     return df
 
@@ -328,6 +401,28 @@ def build_reconstruction_model_for_target(cfg: dict, reco_cfg: dict, target: str
         cfg, reco_cfg, route_class, target
     )
     load_state_dict(model, checkpoint, f"reconstruction class{route_class} {target}")
+    return model
+
+
+def build_joint_model_for_route(
+    cfg: dict, joint_cfg: dict, route_class: str, data_representation
+):
+    root = resolve_joint_direction_root(cfg, joint_cfg, route_class)
+    manifest = EnergyWeightManifest.load(root / "energy_weight_manifest.json")
+    stage = str(cfg.get("joint_direction", {}).get("stage", "stage_b"))
+    model = build_joint_direction_model(
+        joint_cfg,
+        stage,
+        data_representation,
+        manifest,
+        steps_per_optimizer_epoch=1,
+    )
+    checkpoint = resolve_joint_direction_checkpoint(cfg, joint_cfg, route_class)
+    model.load_state_dict(checkpoint_state(checkpoint), strict=True)
+    print(
+        f"[Checkpoint] loaded reconstruction class{route_class} "
+        f"zenith_azimuth: {checkpoint}"
+    )
     return model
 
 
@@ -383,33 +478,158 @@ def reco_prediction_frame(cfg: dict, reco_cfg: dict, target: str, route_class: s
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
-def run_reconstruction(cfg: dict, reco_cfg: dict, paths: Dict[str, str], routed: pd.DataFrame) -> pd.DataFrame:
+def joint_prediction_frame(
+    cfg: dict, route_class: str, model, loader
+) -> pd.DataFrame:
+    """Collect one joint model's predictions in the legacy-compatible schema."""
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval().to(device)
+    for param in model.parameters():
+        param.requires_grad = False
+
+    rows = []
+    with torch.no_grad():
+        for batch in loader:
+            batch = move_batch_to_device(batch, device)
+            pred = model(batch)[0].detach().float()
+            if pred.ndim != 2 or pred.shape[1] != 4:
+                raise ValueError(
+                    "Joint direction prediction must have shape [N, 4], got "
+                    f"{tuple(pred.shape)}"
+                )
+            n = pred.shape[0]
+            true_zenith = torch.as_tensor(
+                field_numpy(batch, "zenith", n), device=pred.device, dtype=pred.dtype
+            )
+            true_azimuth = torch.as_tensor(
+                field_numpy(batch, "azimuth", n), device=pred.device, dtype=pred.dtype
+            )
+            true_direction = zenith_azimuth_to_unit_vector(
+                true_zenith, true_azimuth
+            )
+            pred_zenith, pred_azimuth = prediction_to_zenith_azimuth(pred)
+            opening_angle = opening_angle_radians(pred[:, :3], true_direction)
+            residual_zenith = pred_zenith - true_zenith
+            residual_azimuth = _circular_signed_diff(pred_azimuth, true_azimuth)
+            rows.append(
+                pd.DataFrame(
+                    {
+                        "event_key": event_keys_from_batch(batch, n),
+                        "route_class": int(route_class),
+                        "target": "zenith_azimuth",
+                        "true_zenith_radian": true_zenith.cpu().numpy(),
+                        "pred_zenith_radian": pred_zenith.cpu().numpy(),
+                        "true_zenith_degree": torch.rad2deg(true_zenith).cpu().numpy(),
+                        "pred_zenith_degree": torch.rad2deg(pred_zenith).cpu().numpy(),
+                        "residual_zenith_degree": torch.rad2deg(residual_zenith).cpu().numpy(),
+                        "true_azimuth_radian": true_azimuth.cpu().numpy(),
+                        "pred_azimuth_radian": pred_azimuth.cpu().numpy(),
+                        "true_azimuth_degree": torch.rad2deg(true_azimuth).cpu().numpy(),
+                        "pred_azimuth_degree": torch.rad2deg(pred_azimuth).cpu().numpy(),
+                        "residual_azimuth_degree": torch.rad2deg(residual_azimuth).cpu().numpy(),
+                        "pred_azimuth_degree_signed": torch.rad2deg(
+                            _wrap_to_pi(pred_azimuth)
+                        ).cpu().numpy(),
+                        "pred_dir_x": pred[:, 0].cpu().numpy(),
+                        "pred_dir_y": pred[:, 1].cpu().numpy(),
+                        "pred_dir_z": pred[:, 2].cpu().numpy(),
+                        "direction_kappa": pred[:, 3].cpu().numpy(),
+                        # Preserve the two legacy kappa column names as aliases.
+                        # A joint model has one directional concentration.
+                        "zenith_kappa": pred[:, 3].cpu().numpy(),
+                        "azimuth_kappa": pred[:, 3].cpu().numpy(),
+                        "opening_angle_radian": opening_angle.cpu().numpy(),
+                        "opening_angle_degree": torch.rad2deg(opening_angle).cpu().numpy(),
+                    }
+                )
+            )
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def run_reconstruction(
+    cfg: dict,
+    reco_cfg: dict,
+    joint_cfg: dict | None,
+    paths: Dict[str, str],
+    routed: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     targets = [str(target) for target in cfg["reconstruction"]["targets"]]
     route_classes = [str(item) for item in cfg["routing"]["classes"]]
     routed_keys = {
         route_class: set(routed.loc[routed["predicted_route_class"].astype(str) == route_class, "event_key"])
         for route_class in route_classes
     }
+    oracle_keys = {
+        route_class: set(routed.loc[routed["true_route_class"].astype(str) == route_class, "event_key"])
+        for route_class in route_classes
+    }
 
-    outputs = []
+    routed_outputs = []
+    oracle_outputs = []
     for route_class in route_classes:
-        keep_keys = routed_keys[route_class]
-        print(f"[Reconstruction] class{route_class}: routed events={len(keep_keys)}")
-        if not keep_keys:
+        selected_keys = routed_keys[route_class] | oracle_keys[route_class]
+        print(
+            f"[Reconstruction] class{route_class}: "
+            f"routed={len(routed_keys[route_class])}, "
+            f"oracle={len(oracle_keys[route_class])}"
+        )
+        if not selected_keys:
             continue
         percentiles_csv = resolve_percentiles(cfg, route_class=route_class)
-        data_representation, loader = build_loader(cfg, paths, percentiles_csv, reco_cfg)
         for target in targets:
-            model = build_reconstruction_model_for_target(cfg, reco_cfg, target, route_class, data_representation)
-            df = reco_prediction_frame(cfg, reco_cfg, target, route_class, model, loader)
-            df = df[df["event_key"].isin(keep_keys)].copy()
-            print(f"[Reconstruction] class{route_class} {target}: rows={len(df)}")
-            outputs.append(df)
+            if target == "zenith_azimuth":
+                if joint_cfg is None:
+                    raise ValueError(
+                        "reconstruction.targets includes zenith_azimuth but "
+                        "joint_direction.config is missing"
+                    )
+                data_representation, loader = build_loader(
+                    cfg, paths, percentiles_csv, joint_cfg
+                )
+                model = build_joint_model_for_route(
+                    cfg, joint_cfg, route_class, data_representation
+                )
+                all_df = joint_prediction_frame(
+                    cfg, route_class, model, loader
+                )
+            else:
+                data_representation, loader = build_loader(
+                    cfg, paths, percentiles_csv, reco_cfg
+                )
+                model = build_reconstruction_model_for_target(
+                    cfg, reco_cfg, target, route_class, data_representation
+                )
+                all_df = reco_prediction_frame(
+                    cfg, reco_cfg, target, route_class, model, loader
+                )
+            routed_df = all_df[
+                all_df["event_key"].isin(routed_keys[route_class])
+            ].copy()
+            oracle_df = all_df[
+                all_df["event_key"].isin(oracle_keys[route_class])
+            ].copy()
+            print(
+                f"[Reconstruction] class{route_class} {target}: "
+                f"routed rows={len(routed_df)}, oracle rows={len(oracle_df)}"
+            )
+            routed_outputs.append(routed_df)
+            oracle_outputs.append(oracle_df)
             del model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    return pd.concat(outputs, ignore_index=True) if outputs else pd.DataFrame()
+    routed_result = (
+        pd.concat(routed_outputs, ignore_index=True)
+        if routed_outputs
+        else pd.DataFrame()
+    )
+    oracle_result = (
+        pd.concat(oracle_outputs, ignore_index=True)
+        if oracle_outputs
+        else pd.DataFrame()
+    )
+    return routed_result, oracle_result
 
 
 def make_wide_predictions(cls_df: pd.DataFrame, reco_df: pd.DataFrame) -> pd.DataFrame:
@@ -435,7 +655,29 @@ def make_wide_predictions(cls_df: pd.DataFrame, reco_df: pd.DataFrame) -> pd.Dat
     return wide
 
 
-def validate_config(cfg: dict, cls_cfg: dict, reco_cfg: dict) -> None:
+def add_oracle_predictions(
+    wide: pd.DataFrame, oracle_reco_df: pd.DataFrame
+) -> pd.DataFrame:
+    """Append truth-routed reconstruction columns without changing legacy ones."""
+
+    if oracle_reco_df.empty:
+        return wide
+    oracle_wide = make_wide_predictions(
+        wide[["event_key"]].copy(), oracle_reco_df
+    )
+    oracle_wide = oracle_wide.rename(
+        columns={
+            column: f"oracle_{column}"
+            for column in oracle_wide.columns
+            if column != "event_key"
+        }
+    )
+    return wide.merge(oracle_wide, on="event_key", how="left", validate="one_to_one")
+
+
+def validate_config(
+    cfg: dict, cls_cfg: dict, reco_cfg: dict, joint_cfg: dict | None
+) -> None:
     if cfg["task"]["type"] != "inference":
         raise ValueError(f"Expected task.type=inference, got {cfg['task']['type']}")
     if cfg["mc"] != cls_cfg["mc"] or cfg["geometry"] != cls_cfg["geometry"]:
@@ -452,9 +694,33 @@ def validate_config(cfg: dict, cls_cfg: dict, reco_cfg: dict) -> None:
         raise ValueError(
             "Classification target must match inference routing.category"
         )
+    targets = [str(value) for value in cfg["reconstruction"]["targets"]]
+    supported = {"energy", "zenith", "azimuth", "zenith_azimuth"}
+    unknown = sorted(set(targets) - supported)
+    if unknown:
+        raise ValueError(f"Unsupported reconstruction targets: {unknown}")
+    if "zenith_azimuth" in targets:
+        if joint_cfg is None:
+            raise ValueError(
+                "joint_direction.config is required for target zenith_azimuth"
+            )
+        if joint_cfg["mc"] != cfg["mc"] or joint_cfg["geometry"] != cfg["geometry"]:
+            raise ValueError(
+                "Inference and joint-direction configs must use the same mc/geometry"
+            )
+        if joint_cfg["routing"]["category"] != cfg["routing"]["category"]:
+            raise ValueError(
+                "Inference and joint-direction routing.category must match"
+            )
+    elif joint_cfg is not None:
+        raise ValueError(
+            "joint_direction.config was provided but zenith_azimuth is not a target"
+        )
 
 
-def preflight(cfg: dict, cls_cfg: dict, reco_cfg: dict) -> None:
+def preflight(
+    cfg: dict, cls_cfg: dict, reco_cfg: dict, joint_cfg: dict | None
+) -> None:
     paths = resolve_mixed_split_paths(cfg)
     missing = []
     classification_checkpoint = resolve_classification_checkpoint(cfg, cls_cfg)
@@ -478,6 +744,40 @@ def preflight(cfg: dict, cls_cfg: dict, reco_cfg: dict) -> None:
         if not Path(scaler).is_file():
             missing.append(f"class{route_class} scaler: {scaler}")
         for target in cfg["reconstruction"]["targets"]:
+            if str(target) == "zenith_azimuth":
+                if joint_cfg is None:
+                    missing.append("joint-direction training config")
+                    continue
+                root = resolve_joint_direction_root(cfg, joint_cfg, route_class)
+                checkpoint = resolve_joint_direction_checkpoint(
+                    cfg, joint_cfg, route_class
+                )
+                if not checkpoint.is_file():
+                    missing.append(
+                        f"class{route_class} zenith_azimuth checkpoint: {checkpoint}"
+                    )
+                manifest = root / "energy_weight_manifest.json"
+                if not manifest.is_file():
+                    missing.append(
+                        f"class{route_class} energy weight manifest: {manifest}"
+                    )
+                joint_options = cfg.get("joint_direction", {}) or {}
+                selected_stage = str(joint_options.get("stage", "stage_b"))
+                selected_checkpoint = str(
+                    joint_options.get("checkpoint_name", "best_macro_median")
+                )
+                validation = (
+                    root
+                    / "inference"
+                    / "val"
+                    / f"{selected_stage}_{selected_checkpoint}"
+                    / "metrics_summary.csv"
+                )
+                if not validation.is_file():
+                    missing.append(
+                        f"completed class{route_class} joint validation: {validation}"
+                    )
+                continue
             checkpoint = resolve_reconstruction_checkpoint(
                 cfg, reco_cfg, route_class, str(target)
             )
@@ -707,8 +1007,11 @@ def main() -> None:
     cfg = load_yaml(args.config)
     cls_cfg = load_yaml(cfg["classification"]["config"])
     reco_cfg = load_yaml(cfg["reconstruction"]["config"])
-    validate_config(cfg, cls_cfg, reco_cfg)
-    preflight(cfg, cls_cfg, reco_cfg)
+    joint_config_path = (cfg.get("joint_direction", {}) or {}).get("config")
+    joint_cfg = load_yaml(joint_config_path) if joint_config_path else None
+    validate_config(cfg, cls_cfg, reco_cfg, joint_cfg)
+    preflight(cfg, cls_cfg, reco_cfg, joint_cfg)
+    require_cuda(cfg)
 
     out_dir = resolve_output_dir(cfg)
     if os.environ.get("OUTPUT_PREPARED", "0") != "1":
@@ -731,9 +1034,15 @@ def main() -> None:
         .reset_index()
     )
     route_counts.to_csv(out_dir / "routed_event_counts.csv", index=False)
-    reco_df = run_reconstruction(cfg, reco_cfg, paths, cls_df)
+    reco_df, oracle_reco_df = run_reconstruction(
+        cfg, reco_cfg, joint_cfg, paths, cls_df
+    )
     reco_df.to_csv(out_dir / "reconstruction_predictions.csv", index=False)
+    oracle_reco_df.to_csv(
+        out_dir / "oracle_reconstruction_predictions.csv", index=False
+    )
     wide = make_wide_predictions(cls_df, reco_df)
+    wide = add_oracle_predictions(wide, oracle_reco_df)
     wide_path = out_dir / "inference_predictions.csv"
     wide.to_csv(wide_path, index=False)
     print(f"[Output] wrote {wide_path}")
