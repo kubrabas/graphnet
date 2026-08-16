@@ -33,7 +33,7 @@ from direction_utils import (
 )
 from energy_weighting import EnergyWeightManifest
 from metrics import opening_angle_metrics, weighted_mean
-from model import build_joint_direction_model
+from model_factory import build_direction_model
 from pipeline_utils import checkpoint_state, extract_field, move_batch_to_device
 from reporting import write_evaluation_plots
 
@@ -426,7 +426,7 @@ def run_validation_inference(
     ):
         raise RuntimeError("A CUDA GPU is required by this validation config")
 
-    model = build_joint_direction_model(
+    model = build_direction_model(
         config,
         STAGE_NAME,
         data_representation,

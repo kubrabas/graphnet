@@ -9,6 +9,7 @@ import importlib.util
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,13 @@ except ModuleNotFoundError as exc:
 
 
 HERE = Path(__file__).resolve().parent
+JOINT_DIR = HERE.parent
+if str(JOINT_DIR) not in sys.path:
+    sys.path.insert(0, str(JOINT_DIR))
+
+from experiment_config import validate_experiment_extensions  # noqa: E402
+
+
 RUN_SCRIPT = HERE / "run_train.sh"
 EXPECTED_CLASSES = ("0", "1")
 EXPECTED_GRAPHNET_SOURCE = Path("/project/def-nahee/kbas/graphnet/src")
@@ -141,6 +149,7 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("environment.container_image is required")
     if not RUN_SCRIPT.is_file():
         raise FileNotFoundError(f"SLURM worker is missing: {RUN_SCRIPT}")
+    validate_experiment_extensions(config)
 
 
 def output_dir(config: dict[str, Any], route_class: str) -> Path:

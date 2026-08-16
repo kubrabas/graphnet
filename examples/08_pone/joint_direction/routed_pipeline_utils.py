@@ -259,6 +259,7 @@ def prepare_target_dir(
                 "run_manifest.json",
                 "data_audit.json",
                 "energy_weight_manifest.json",
+                "node_feature_contract.json",
                 "stage_a_vmf",
                 "stage_b_angular_hybrid",
                 "inference",

@@ -31,7 +31,7 @@ from energy_weighting import fit_energy_weight_manifest
 from model import build_joint_direction_model
 from pipeline_utils import extract_field
 from routed_data import build_data_representation, build_loaders
-from routed_pipeline_utils import load_yaml, resolve_routed_split_paths
+from routed_pipeline_utils import checkpoint_state, load_yaml, resolve_routed_split_paths
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,10 +39,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-c", "--config", required=True, type=Path)
     parser.add_argument("--route-class", required=True, choices=("0", "1"))
     parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument(
+        "--consume-all",
+        action="store_true",
+        help="Exhaust the validation loader before shutting spawned workers down",
+    )
     parser.add_argument(
         "--forward",
         action="store_true",
         help="Also run one CPU Stage-B forward/loss pass on the four graphs",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        help="Strict-load this existing checkpoint before the forward pass",
     )
     return parser.parse_args()
 
@@ -50,7 +61,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     config = copy.deepcopy(load_yaml(args.config))
-    config["loader"]["batch_size"] = 4
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    config["loader"]["batch_size"] = args.batch_size
     config["loader"]["num_workers"] = args.workers
 
     split_paths, scaler = resolve_routed_split_paths(config, args.route_class)
@@ -59,8 +72,13 @@ def main() -> int:
         config, split_paths, graph, splits=("val",)
     )
     iterator = iter(loaders["val"])
+    batches_consumed = 0
     try:
         batch = next(iterator)
+        batches_consumed = 1
+        if args.consume_all:
+            for _ in iterator:
+                batches_consumed += 1
     finally:
         # The production trainer owns the loader lifecycle. This short test
         # exits after one batch, so shut spawned workers down explicitly to
@@ -96,7 +114,7 @@ def main() -> int:
     if not bool(torch.isfinite(tensors["totalEnergy"]).all()):
         raise ValueError("Smoke batch contains non-finite energy")
 
-    if args.forward:
+    if args.forward or args.checkpoint is not None:
         edges = torch.as_tensor(
             config["weighting"]["log10_energy_bin_edges"], dtype=torch.float64
         )
@@ -115,6 +133,10 @@ def main() -> int:
             manifest,
             steps_per_optimizer_epoch=1,
         ).eval()
+        if args.checkpoint is not None:
+            if not args.checkpoint.is_file():
+                raise FileNotFoundError(args.checkpoint)
+            model.load_state_dict(checkpoint_state(args.checkpoint), strict=True)
         with torch.no_grad():
             predictions = model(batch)
             prediction = predictions[0]
@@ -134,10 +156,21 @@ def main() -> int:
     print(f"constituent_flavors={[entry.flavor for entry in split_paths['val']]}")
     print(f"scaler={scaler}")
     print(f"batch_events={next(iter(sizes.values()))}")
+    print(f"batches_consumed={batches_consumed}")
     print(f"source_flavor_ids={flavor_ids}")
-    if args.forward:
+    print(f"graph_input_features={graph.nb_inputs}")
+    print(f"graph_output_features={graph.nb_outputs}")
+    print(f"graph_output_feature_names={graph.output_feature_names}")
+    if args.forward or args.checkpoint is not None:
+        trainable_parameters = sum(
+            parameter.numel() for parameter in model.parameters()
+            if parameter.requires_grad
+        )
+        print(f"trainable_parameters={trainable_parameters}")
         print(f"prediction_shape={tuple(prediction.shape)}")
         print(f"stage_b_loss={float(loss):.8g}")
+        if args.checkpoint is not None:
+            print(f"strict_checkpoint_load=passed:{args.checkpoint.resolve()}")
         print("model_forward_test=passed")
     print("loader_smoke_test=passed")
     return 0

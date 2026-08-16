@@ -58,6 +58,10 @@ from direction_utils import (
 )
 from energy_weighting import EnergyWeightManifest
 from model import build_joint_direction_model
+from routed_data import (
+    build_data_representation as build_joint_data_representation,
+    loader_feature_names as joint_loader_feature_names,
+)
 from routed_pipeline_utils import checkpoint_state
 
 
@@ -150,6 +154,7 @@ def resolve_reconstruction_checkpoint(
 def resolve_joint_direction_root(
     cfg: dict, joint_cfg: dict, route_class: str
 ) -> Path:
+    experiment_name = resolve_joint_direction_experiment_name(cfg)
     return (
         Path(cfg["output"]["root_dir"])
         / cfg["mc"]
@@ -157,10 +162,38 @@ def resolve_joint_direction_root(
         / "reconstruction"
         / cfg["routing"]["category"]
         / f"class{route_class}"
-        / cfg["reconstruction"].get("experiment_name", "baseline")
+        / experiment_name
         / joint_cfg["output"]["dirs"]["train"]
         / "zenith_azimuth"
     )
+
+
+def resolve_joint_direction_experiment_name(cfg: dict) -> str:
+    """Resolve and validate the experiment leaf used by joint inference."""
+
+    joint_options = cfg.get("joint_direction", {}) or {}
+    explicit_experiment = joint_options.get("experiment_name")
+    if explicit_experiment is None:
+        # Legacy routed-inference configs used the separate reconstruction
+        # experiment for both energy and joint direction. Keep that exact
+        # fallback so every existing config continues to resolve unchanged.
+        experiment_name = cfg["reconstruction"].get(
+            "experiment_name", "baseline"
+        )
+    else:
+        experiment_name = str(explicit_experiment).strip()
+    experiment_name = str(experiment_name).strip()
+    if (
+        not experiment_name
+        or experiment_name in {".", ".."}
+        or Path(experiment_name).is_absolute()
+        or Path(experiment_name).name != experiment_name
+    ):
+        raise ValueError(
+            "The resolved joint-direction experiment name must be one "
+            "non-empty directory name"
+        )
+    return experiment_name
 
 
 def resolve_joint_direction_checkpoint(
@@ -294,6 +327,59 @@ def build_loader(cfg: dict, paths: Dict[str, str], percentiles_csv: str, model_c
         drop_last=False,
         num_workers=loader_cfg["num_workers"],
         multiprocessing_context=loader_cfg.get("multiprocessing_context", "spawn"),
+        persistent_workers=loader_cfg["num_workers"] > 0,
+        pin_memory=loader_cfg.get("pin_memory", True),
+    )
+    return data_representation, loader
+
+
+def build_joint_loader(
+    cfg: dict,
+    paths: Dict[str, str],
+    percentiles_csv: str,
+    joint_cfg: dict,
+):
+    """Build a test loader with the joint model's exact node-feature contract.
+
+    Classification and legacy separate reconstruction deliberately continue to
+    use :func:`build_loader`. Only the opt-in ``zenith_azimuth`` branch reaches
+    this function. This lets PMT-direction experiments query their auxiliary
+    parquet column while baseline, alpha, and wide configs resolve to the same
+    five-feature graph used during training.
+    """
+
+    features = joint_loader_feature_names(joint_cfg)
+    truth_all = [
+        field
+        for field in unique([*EVENT_ID_FIELDS, *cfg["data"]["truth_all"]])
+        if field and field != "event_no"
+    ]
+    loader_cfg = cfg["inference"]
+    data_representation = build_joint_data_representation(
+        joint_cfg, percentiles_csv=percentiles_csv
+    )
+
+    datasets = [
+        ParquetDataset(
+            path=path,
+            pulsemaps=cfg["data"]["pulsemaps"],
+            truth_table=cfg["data"]["truth_table"],
+            features=features,
+            truth=truth_all,
+            data_representation=data_representation,
+        )
+        for path in paths.values()
+    ]
+    dataset = EnsembleDataset(datasets)
+    loader = DataLoader(
+        dataset,
+        batch_size=loader_cfg["batch_size"],
+        shuffle=False,
+        drop_last=False,
+        num_workers=loader_cfg["num_workers"],
+        multiprocessing_context=loader_cfg.get(
+            "multiprocessing_context", "spawn"
+        ),
         persistent_workers=loader_cfg["num_workers"] > 0,
         pin_memory=loader_cfg.get("pin_memory", True),
     )
@@ -584,7 +670,7 @@ def run_reconstruction(
                         "reconstruction.targets includes zenith_azimuth but "
                         "joint_direction.config is missing"
                     )
-                data_representation, loader = build_loader(
+                data_representation, loader = build_joint_loader(
                     cfg, paths, percentiles_csv, joint_cfg
                 )
                 model = build_joint_model_for_route(
@@ -711,6 +797,18 @@ def validate_config(
         if joint_cfg["routing"]["category"] != cfg["routing"]["category"]:
             raise ValueError(
                 "Inference and joint-direction routing.category must match"
+            )
+        effective_experiment = resolve_joint_direction_experiment_name(cfg)
+        joint_config_experiment = str(
+            joint_cfg.get("experiment_name", "")
+        ).strip()
+        if effective_experiment != joint_config_experiment:
+            raise ValueError(
+                "Joint-direction experiment mismatch: inference resolves "
+                f"{effective_experiment!r}, but joint_direction.config "
+                f"declares {joint_config_experiment!r}. Set "
+                "joint_direction.experiment_name explicitly when using a "
+                "non-baseline joint config."
             )
     elif joint_cfg is not None:
         raise ValueError(

@@ -192,12 +192,19 @@ def build_joint_direction_model(
 
     model_config = config["model"]
     stage = config["training"][stage_name]
-    features = config["data"]["features"]
     objective = str(stage["objective"])
     vmf_factor = float(config["loss"]["vmf_factor"])
 
+    # A NodeDefinition may add or remove columns after detector scaling. The
+    # backbone must follow the graph it actually receives, not merely the raw
+    # parquet feature list. For the historical NodesAsPulses path nb_outputs
+    # remains exactly len(data.features), preserving checkpoint shapes.
+    nb_inputs = int(data_representation.nb_outputs)
+    if nb_inputs <= 0:
+        raise ValueError(f"data_representation.nb_outputs must be positive: {nb_inputs}")
+
     backbone = DynEdge(
-        nb_inputs=len(features),
+        nb_inputs=nb_inputs,
         nb_neighbours=int(model_config["nb_neighbours"]),
         global_pooling_schemes=list(model_config["global_pooling_schemes"]),
         add_global_variables_after_pooling=bool(
@@ -247,4 +254,3 @@ def build_joint_direction_model(
         vmf_factor=vmf_factor,
         objective=objective,
     )
-

@@ -22,6 +22,22 @@ from graphnet.models.data_representation import KNNGraph, NodesAsPulses
 from graphnet.models.detector.pone import PONE
 
 try:
+    from .experiment_config import node_feature_augmentations
+except ImportError:  # Direct execution with joint_direction on PYTHONPATH.
+    from experiment_config import node_feature_augmentations
+
+try:
+    from .pmt_direction_features import (
+        PONE_V3_PMT_DIRECTION_CONTRACT,
+        PONEV3PMTDirectionNodes,
+    )
+except ImportError:  # Direct execution with joint_direction on PYTHONPATH.
+    from pmt_direction_features import (
+        PONE_V3_PMT_DIRECTION_CONTRACT,
+        PONEV3PMTDirectionNodes,
+    )
+
+try:
     from .routed_pipeline_utils import (
         DEFAULT_FLAVORS,
         RoutedSplitPath,
@@ -72,6 +88,24 @@ FLAVOR_PID = {"Muon": 14, "Electron": 12, "Tau": 16, "NC": 12}
 SOURCE_FLAVOR_ID = {
     flavor: index for index, flavor in enumerate(DEFAULT_FLAVORS)
 }
+
+
+def loader_feature_names(config: Mapping[str, Any]) -> list[str]:
+    """Resolve the parquet columns required to construct every graph node."""
+
+    base = [str(value) for value in config.get("data", {}).get("features", [])]
+    if not base or len(base) != len(set(base)):
+        raise ValueError("data.features must be non-empty and unique")
+    augmentations = node_feature_augmentations(config)
+    if not augmentations:
+        return base
+    contract = PONE_V3_PMT_DIRECTION_CONTRACT
+    if tuple(base) != tuple(contract.scaled_features):
+        raise ValueError(
+            "pmt_direction_v3 requires the established scaled base features "
+            f"{list(contract.scaled_features)}, got {base}"
+        )
+    return list(contract.loader_features)
 
 
 def _entry_flavor_path(entry: RoutedSplitPath | Mapping[str, Any]) -> tuple[str, Path]:
@@ -206,7 +240,7 @@ def deep_data_audit(
     id_columns = _id_columns(config)
     truth_columns = required_truth_columns(config)
     data = config.get("data", {})
-    feature_columns = ["event_no", *list(data["features"])]
+    feature_columns = ["event_no", *loader_feature_names(config)]
     histogram_edges = np.asarray(
         config["weighting"]["log10_energy_bin_edges"], dtype=float
     )
@@ -454,7 +488,8 @@ def build_data_representation(
     """Build the established P-ONE KNN graph using the routed class scaler."""
 
     data = config["data"]
-    features = list(data["features"])
+    features = [str(value) for value in data["features"]]
+    augmentations = node_feature_augmentations(config)
     configured = percentiles_csv or data.get("percentiles_csv")
     if not configured:
         route_class = config.get("routing", {}).get("class")
@@ -473,12 +508,34 @@ def build_data_representation(
     scaler = Path(configured)
     if not scaler.is_file():
         raise FileNotFoundError(f"Percentiles CSV does not exist: {scaler}")
-    return KNNGraph(
-        detector=PONE(percentiles_csv=str(scaler), selected_features=features),
-        node_definition=NodesAsPulses(),
+    if not augmentations:
+        # Keep the established construction byte-for-byte equivalent for old
+        # configs and checkpoints.
+        return KNNGraph(
+            detector=PONE(percentiles_csv=str(scaler), selected_features=features),
+            node_definition=NodesAsPulses(),
+            nb_nearest_neighbours=int(config["model"]["nb_neighbours"]),
+            distance_as_edge_feature=False,
+        )
+
+    contract = PONE_V3_PMT_DIRECTION_CONTRACT
+    graph = KNNGraph(
+        detector=PONE(
+            percentiles_csv=str(scaler),
+            selected_features=list(contract.scaled_features),
+            replace_with_identity=list(contract.identity_features),
+        ),
+        node_definition=PONEV3PMTDirectionNodes(),
+        input_feature_names=list(contract.loader_features),
         nb_nearest_neighbours=int(config["model"]["nb_neighbours"]),
         distance_as_edge_feature=False,
     )
+    if tuple(graph.output_feature_names) != tuple(contract.output_features):
+        raise RuntimeError(
+            "pmt_direction_v3 output feature contract drifted: "
+            f"{graph.output_feature_names}"
+        )
+    return graph
 
 
 def _constant_source_flavor_id(_graph, *, value: int) -> torch.Tensor:
@@ -535,7 +592,7 @@ def build_loaders(
             path=str(path),
             pulsemaps=str(data.get("pulsemaps", "features")),
             truth_table=str(data.get("truth_table", "truth")),
-            features=list(data["features"]),
+            features=loader_feature_names(config),
             truth=truth,
             data_representation=data_representation,
             cache_size=int(data.get("parquet_cache_size", 1)),
@@ -559,7 +616,11 @@ def build_loaders(
         if workers < 0:
             raise ValueError("loader.num_workers cannot be negative")
         kwargs: Dict[str, Any] = {
-            "batch_size": int(loader["batch_size"]),
+            "batch_size": int(
+                loader["batch_size"]
+                if is_train
+                else loader.get("val_batch_size", loader["batch_size"])
+            ),
             "shuffle": is_train,
             "drop_last": is_train,
             "num_workers": workers,

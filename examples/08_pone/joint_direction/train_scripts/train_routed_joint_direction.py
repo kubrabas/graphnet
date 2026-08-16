@@ -45,13 +45,18 @@ import yaml
 from pytorch_lightning.callbacks import EarlyStopping
 
 from callbacks import EnergyBinMetricsCSV, EpochMetricsCSV, NamedCheckpoint, ResourceCSV
-from model import build_joint_direction_model
+from experiment_config import node_feature_augmentations, validate_experiment_extensions
+from model_factory import (
+    build_direction_model,
+    build_model_data_representation,
+    configured_model_name,
+)
 from reporting import plot_training_history
 from routed_data import (
-    build_data_representation,
     build_loaders,
     deep_data_audit,
     fit_or_load_energy_manifest,
+    loader_feature_names,
     write_data_audit,
 )
 from routed_pipeline_utils import (
@@ -136,14 +141,13 @@ def validate_config(config: Mapping[str, Any]) -> None:
             "Native/final_weight is forbidden; use only the train-derived weighting section"
         )
     weighting = config.get("weighting", {})
-    if float(weighting.get("alpha", -1.0)) != 0.5:
-        raise ValueError("weighting.alpha must remain 0.5 for this baseline")
     if float(weighting.get("clip_min", -1.0)) != 0.2:
         raise ValueError("weighting.clip_min must remain 0.2 for this baseline")
     if float(weighting.get("clip_max", -1.0)) != 5.0:
         raise ValueError("weighting.clip_max must remain 5.0 for this baseline")
     if str(weighting.get("out_of_range")) != "error":
         raise ValueError("weighting.out_of_range must be error")
+    validate_experiment_extensions(config)
 
     if config.get("loss", {}).get("angular_surrogate") != "opening_angle":
         raise ValueError("loss.angular_surrogate must be opening_angle")
@@ -253,6 +257,12 @@ def write_run_manifest(
             ),
             "graphnet_git_revision": _git_revision(),
             "submitted_config_sha256": submitted_config_sha256,
+            "experiment_name": config["experiment_name"],
+            "experiment_varied_fields": list(
+                (config.get("experiment_contract", {}) or {}).get(
+                    "varied_fields", []
+                )
+            ),
             "mc": config["mc"],
             "geometry": config["geometry"],
             "routing_category": config["routing"]["category"],
@@ -268,6 +278,49 @@ def write_run_manifest(
         },
         output_dir / "run_manifest.json",
     )
+
+
+def write_node_feature_contract(
+    config: Mapping[str, Any], data_representation, output_dir: Path
+) -> None:
+    """Persist the exact parquet-to-GNN feature transformation."""
+
+    loader_features = loader_feature_names(config)
+    output_features = [str(value) for value in data_representation.output_feature_names]
+    model_name = configured_model_name(config)
+    payload: dict[str, Any] = {
+        "base_scaled_features": [str(value) for value in config["data"]["features"]],
+        "node_feature_augmentations": list(node_feature_augmentations(config)),
+        "parquet_loader_features": loader_features,
+        "model_node_features": output_features,
+        "consumed_auxiliary_features": [
+            value for value in loader_features if value not in output_features
+        ],
+        "data_representation": data_representation.__class__.__name__,
+        "model_name": model_name,
+        "representation_nb_inputs": int(data_representation.nb_inputs),
+        "representation_nb_outputs": int(data_representation.nb_outputs),
+    }
+    if model_name == "dynedge":
+        payload.update(
+            {
+                "base_scaled_features": [
+                    str(value) for value in config["data"]["features"]
+                ],
+                "knn_coordinate_output_columns": [0, 1, 2],
+                "knn_coordinate_features": output_features[:3],
+            }
+        )
+    else:
+        payload.update(
+            {
+                "base_scaled_features": [],
+                "raw_identity_features": loader_features,
+                "sequence_sort_feature": "dom_time",
+                "edge_assignment": None,
+            }
+        )
+    atomic_json_dump(payload, output_dir / "node_feature_contract.json")
 
 
 def snapshot_config(
@@ -316,7 +369,7 @@ def train_stage(
     stage_dir.mkdir(parents=True, exist_ok=True)
     accumulation = int(config["loader"]["accumulate_grad_batches"])
     optimizer_steps = math.ceil(len(loaders["train"]) / accumulation)
-    model = build_joint_direction_model(
+    model = build_direction_model(
         config,
         stage_name,
         data_representation,
@@ -492,7 +545,12 @@ def main() -> int:
         f"{max(energy_manifest.bin_weights):.4g}]"
     )
 
-    data_representation = build_data_representation(config, percentiles_csv)
+    data_representation = build_model_data_representation(config, percentiles_csv)
+    write_node_feature_contract(config, data_representation, output_dir)
+    print(
+        "[Features] parquet="
+        f"{loader_feature_names(config)} -> model={data_representation.output_feature_names}"
+    )
     loaders = build_loaders(
         config,
         split_paths,
